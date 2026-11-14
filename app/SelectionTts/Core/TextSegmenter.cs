@@ -24,97 +24,6 @@ public static class TextSegmenter
     public const int TargetChars = 250;
     public const int FirstTargetChars = 50;
 
-    /// <summary>朗读板上的分段上限：单段超过这个长度就按句末标点再切。</summary>
-    public const int ParagraphMaxChars = 500;
-
-    /// <summary>完全没有标点的长串按这个长度硬切，否则高亮会一屏不动。</summary>
-    public const int NoPunctuationBlockChars = 40;
-
-    /// <summary>
-    /// 朗读板的分段：先按换行分段，长段按句末切到 500 字以内，
-    /// 切完仍然没有任何标点的长串按 40 字硬切。
-    /// </summary>
-    public static List<TextSegment> SplitParagraphs(string text)
-    {
-        var result = new List<TextSegment>();
-        if (string.IsNullOrEmpty(text))
-        {
-            return result;
-        }
-
-        var start = 0;
-        for (var i = 0; i <= text.Length; i++)
-        {
-            if (i < text.Length && text[i] != '\n')
-            {
-                continue;
-            }
-
-            AppendParagraph(result, text, start, i);
-            start = i + 1;
-        }
-
-        return result;
-    }
-
-    private static void AppendParagraph(List<TextSegment> result, string text, int start, int end)
-    {
-        while (start < end && char.IsWhiteSpace(text[start]))
-        {
-            start++;
-        }
-
-        while (end > start && char.IsWhiteSpace(text[end - 1]))
-        {
-            end--;
-        }
-
-        if (end <= start)
-        {
-            return;
-        }
-
-        foreach (var piece in SplitCore(text.Substring(start, end - start), ParagraphMaxChars))
-        {
-            var absoluteStart = start + piece.Start;
-            AppendBlock(result, text, absoluteStart, absoluteStart + piece.Length);
-        }
-    }
-
-    private static void AppendBlock(List<TextSegment> result, string text, int start, int end)
-    {
-        if (end <= start)
-        {
-            return;
-        }
-
-        if (end - start > NoPunctuationBlockChars && !ContainsPunctuation(text, start, end))
-        {
-            for (var cursor = start; cursor < end; cursor += NoPunctuationBlockChars)
-            {
-                AddSlice(result, text, cursor, Math.Min(end, cursor + NoPunctuationBlockChars));
-            }
-
-            return;
-        }
-
-        AddSlice(result, text, start, end);
-    }
-
-    private static bool ContainsPunctuation(string text, int start, int end)
-    {
-        for (var i = start; i < end; i++)
-        {
-            var c = text[i];
-            if (Array.IndexOf(HardBreakChars, c) >= 0 || Array.IndexOf(SoftBreakChars, c) >= 0)
-            {
-                return true;
-            }
-        }
-
-        return false;
-    }
-
     private static readonly char[] HardBreakChars =
         ['。', '！', '？', '；', '!', '?', ';', '\n'];
 
@@ -194,9 +103,6 @@ public static class TextSegmenter
         Flush();
         return result;
     }
-
-    /// <summary>按句末标点打包到 target 以内，不做首块特殊处理。</summary>
-    private static List<TextSegment> SplitCore(string text, int target) => Split(text, target, 0);
 
     private static void AddSlice(List<TextSegment> result, string text, int start, int end)
     {

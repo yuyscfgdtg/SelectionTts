@@ -16,12 +16,13 @@ using Point = System.Windows.Point;
 namespace SelectionTts.Ui;
 
 /// <summary>
-/// 朗读板：常驻浮窗，显示当前朗读目标、状态、进度和高亮位置。
+/// 朗读板：常驻浮窗，显示当前朗读目标、合成进度和"读到第几行"。
 ///
 /// 关键约束：不抢焦点。用 WS_EX_NOACTIVATE + SW_SHOWNOACTIVATE 显示，
 /// 复制时焦点仍留在原来的程序里，光标不会跳。
 ///
-/// 板子只读状态，不持有业务逻辑——文本和进度都在 ReaderService 里。
+/// 正文按板子宽度自己折行，一行就是一个单元格：
+/// 读到哪行哪行变绿，点哪行就从哪行第一个字开始读。
 /// </summary>
 public partial class ReaderBoardWindow : Window
 {
@@ -29,8 +30,14 @@ public partial class ReaderBoardWindow : Window
     private const int WS_EX_NOACTIVATE = 0x08000000;
     private const int WS_EX_TOOLWINDOW = 0x00000080;
 
+    private const double BodyFontSize = 13.5;
+    private const double BodyLineHeight = 21;
+
     private static readonly Brush ActiveBackground =
         Freeze(new SolidColorBrush(Color.FromArgb(0x3A, 0x3D, 0xDC, 0x84)));
+
+    private static readonly Brush HoverBackground =
+        Freeze(new SolidColorBrush(Color.FromArgb(0x14, 0xFF, 0xFF, 0xFF)));
 
     private static readonly Brush NormalForeground =
         Freeze(new SolidColorBrush(Color.FromRgb(0xD1, 0xD5, 0xDB)));
@@ -53,15 +60,17 @@ public partial class ReaderBoardWindow : Window
     private static readonly Brush DotFailed =
         Freeze(new SolidColorBrush(Color.FromRgb(0xEF, 0x44, 0x44)));
 
-    private sealed record BlockView(TextBlock Element, int Start, int End);
+    private sealed record LineView(TextBlock Element, int Start, int End, int Index);
 
     private readonly AppSettings _settings;
     private readonly ReaderService _reader;
     private readonly DispatcherTimer _timer;
-    private readonly List<BlockView> _blocks = [];
+    private readonly DispatcherTimer _resizeTimer;
+    private readonly List<LineView> _lines = [];
 
     private string _renderedText = "";
-    private int _activeBlock = -1;
+    private double _renderedWidth;
+    private int _activeLine = -1;
     private bool _enabled;
     private long _lastUserScrollAt;
     private Point _dragStartScreen;
@@ -78,12 +87,13 @@ public partial class ReaderBoardWindow : Window
 
         CloseButton.Click += (_, _) => HideBoard();
         PauseButton.Click += (_, _) => TogglePause();
-        StopButton.Click += (_, _) => _reader.Stop();
+        StopButton.Click += (_, _) => ToggleMaster?.Invoke();
 
         Header.MouseLeftButtonDown += OnHeaderMouseDown;
         Header.MouseMove += OnHeaderMouseMove;
         Header.MouseLeftButtonUp += OnHeaderMouseUp;
         PreviewMouseWheel += (_, _) => _lastUserScrollAt = Environment.TickCount64;
+        Scroller.SizeChanged += (_, _) => ScheduleRelayout();
 
         _timer = new DispatcherTimer(DispatcherPriority.Background)
         {
@@ -91,7 +101,21 @@ public partial class ReaderBoardWindow : Window
         };
         _timer.Tick += (_, _) => Render();
         _timer.Start();
+
+        // 拖动窗口时尺寸不变，但会被反复触发；用一个短延迟把连续变化合并成一次排版
+        _resizeTimer = new DispatcherTimer(DispatcherPriority.Background)
+        {
+            Interval = TimeSpan.FromMilliseconds(180),
+        };
+        _resizeTimer.Tick += (_, _) =>
+        {
+            _resizeTimer.Stop();
+            RelayoutIfNeeded();
+        };
     }
+
+    /// <summary>板子上的"停止/启动"就是软件总开关，由 App 接到 SetWatching。</summary>
+    public event Action? ToggleMaster;
 
     public void SetEnabled(bool enabled)
     {
@@ -152,8 +176,7 @@ public partial class ReaderBoardWindow : Window
 
     private void TogglePause()
     {
-        var state = _reader.GetState();
-        if (state.Status == ReadStatus.Paused)
+        if (_reader.GetState().Status == ReadStatus.Paused)
         {
             _reader.Resume();
         }
@@ -175,9 +198,11 @@ public partial class ReaderBoardWindow : Window
 
         PauseButton.IsEnabled = state.Status
             is ReadStatus.Preparing or ReadStatus.Playing or ReadStatus.Paused;
-        StopButton.IsEnabled = state.Status
-            is ReadStatus.Preparing or ReadStatus.Playing or ReadStatus.Paused;
         PauseButton.Content = state.Status == ReadStatus.Paused ? "继续" : "暂停";
+
+        // 右按钮永远是总开关：亮着显示"停止"，关掉之后显示"启动"
+        StopButton.IsEnabled = true;
+        StopButton.Content = "停止";
 
         StatusText.Text = state.Status == ReadStatus.Preparing
             ? $"正在合成 {(int)Math.Round(state.SynthesisProgress * 100)}%"
@@ -195,7 +220,7 @@ public partial class ReaderBoardWindow : Window
 
         if (state.CharCount == 0)
         {
-            ClearBlocks();
+            ClearLines();
             MetaText.Text = "复制文本后自动朗读";
             ProgressFill.Width = 0;
             return;
@@ -203,28 +228,49 @@ public partial class ReaderBoardWindow : Window
 
         if (state.Text != _renderedText)
         {
-            RebuildBlocks(state.Text);
+            RebuildLines(state.Text);
         }
 
         MetaText.Text = state.Status switch
         {
-            ReadStatus.Preparing => $"已合成 {state.SynthChars}/{state.CharCount} 字",
+            ReadStatus.Preparing => $"已合成 {state.SynthChars}/{state.SynthTotal} 字",
             ReadStatus.Completed => $"共 {state.CharCount} 字",
             ReadStatus.Failed => state.Error ?? "",
             _ => $"剩余 {FormatSeconds(state.RemainingSeconds)}",
         };
 
-        // 进度条只表示"引擎合成到哪了"；合成结束就收起，朗读进度交给高亮。
+        // 进度条只表示"引擎合成到哪了"；合成结束就收起，朗读进度交给高亮行。
         var showBar = !state.SynthesisDone &&
                       state.Status is ReadStatus.Preparing or ReadStatus.Playing;
         ProgressFill.Width = showBar
             ? Math.Max(0, ProgressTrack.ActualWidth * state.SynthesisProgress)
             : 0;
 
-        var index = FindBlockIndex(state.CharIndex);
-        if (index != _activeBlock)
+        var index = FindLineIndex(state.CharIndex);
+        if (index != _activeLine)
         {
-            SetActiveBlock(index);
+            SetActiveLine(index);
+        }
+    }
+
+    private void RenderDisabled()
+    {
+        StatusText.Text = "已关闭";
+        MetaText.Text = "按 Ctrl+Alt+R 启用朗读";
+        StatusDot.Fill = DotIdle;
+
+        PauseButton.IsEnabled = false;
+        PauseButton.Content = "暂停";
+
+        // 关掉之后还能从板子上打开，不用再按热键
+        StopButton.IsEnabled = true;
+        StopButton.Content = "启动";
+
+        ProgressFill.Width = 0;
+
+        if (_renderedText.Length > 0)
+        {
+            ClearLines();
         }
     }
 
@@ -236,99 +282,151 @@ public partial class ReaderBoardWindow : Window
             : $"{span.Minutes:00}:{span.Seconds:00}";
     }
 
-    private void RenderDisabled()
+    private void ScheduleRelayout()
     {
-        StatusText.Text = "已关闭";
-        MetaText.Text = "按 Ctrl+Alt+R 启用朗读";
-        StatusDot.Fill = DotIdle;
-        PauseButton.IsEnabled = false;
-        StopButton.IsEnabled = false;
-        PauseButton.Content = "暂停";
-        ProgressFill.Width = 0;
-
-        if (_renderedText.Length > 0)
+        if (!IsVisible || _renderedText.Length == 0)
         {
-            ClearBlocks();
+            return;
+        }
+
+        var width = AvailableWidth();
+        if (Math.Abs(width - _renderedWidth) < 2)
+        {
+            return;
+        }
+
+        _resizeTimer.Stop();
+        _resizeTimer.Start();
+    }
+
+    private void RelayoutIfNeeded()
+    {
+        if (_renderedText.Length == 0)
+        {
+            return;
+        }
+
+        var width = AvailableWidth();
+        if (Math.Abs(width - _renderedWidth) >= 2)
+        {
+            RebuildLines(_renderedText);
         }
     }
 
-    private void ClearBlocks()
+    private double AvailableWidth()
+    {
+        var viewport = Scroller.ViewportWidth;
+        if (viewport > 32)
+        {
+            return viewport - 6;
+        }
+
+        return Math.Max(80, Scroller.ActualWidth - 28);
+    }
+
+    private void ClearLines()
     {
         _renderedText = "";
-        _activeBlock = -1;
-        _blocks.Clear();
+        _activeLine = -1;
+        _lines.Clear();
         BlocksPanel.Children.Clear();
     }
 
-    private void RebuildBlocks(string text)
+    private void RebuildLines(string text)
     {
+        var width = AvailableWidth();
         _renderedText = text;
-        _activeBlock = -1;
-        _blocks.Clear();
+        _renderedWidth = width;
+        _activeLine = -1;
+        _lines.Clear();
         BlocksPanel.Children.Clear();
 
-        foreach (var block in TextSegmenter.SplitParagraphs(text))
+        var typeface = new Typeface(FontFamily, FontStyle, FontWeight, FontStretch);
+        var dpi = VisualTreeHelper.GetDpi(this);
+        var layout = BoardTextLayout.Build(text, width, typeface, BodyFontSize, dpi.PixelsPerDip);
+
+        foreach (var line in layout)
         {
             var element = new TextBlock
             {
-                Text = block.Text,
-                TextWrapping = TextWrapping.Wrap,
+                Text = line.Text.Length == 0 ? "\u00A0" : line.Text,
+                FontSize = BodyFontSize,
+                LineHeight = BodyLineHeight,
+                TextWrapping = TextWrapping.NoWrap,
                 Foreground = NormalForeground,
-                FontSize = 13.5,
-                LineHeight = 21,
-                Margin = new Thickness(0, 0, 0, 6),
+                Background = Brushes.Transparent,
+                Padding = new Thickness(0),
+                Margin = new Thickness(0),
                 Cursor = Cursors.Hand,
             };
 
-            var start = block.Start;
+            var view = new LineView(element, line.Start, line.Start + Math.Max(1, line.Length), _lines.Count);
+
             element.MouseLeftButtonUp += (_, _) =>
             {
                 if (_enabled)
                 {
-                    _reader.JumpTo(start);
+                    _reader.JumpTo(view.Start);
                 }
             };
 
-            _blocks.Add(new BlockView(element, block.Start, block.End));
+            element.MouseEnter += (_, _) =>
+            {
+                if (view.Index != _activeLine)
+                {
+                    element.Background = HoverBackground;
+                }
+            };
+
+            element.MouseLeave += (_, _) =>
+            {
+                if (view.Index != _activeLine)
+                {
+                    element.Background = Brushes.Transparent;
+                }
+            };
+
+            _lines.Add(view);
             BlocksPanel.Children.Add(element);
         }
     }
 
-    private int FindBlockIndex(int charIndex)
+    private int FindLineIndex(int charIndex)
     {
-        for (var i = 0; i < _blocks.Count; i++)
+        for (var i = 0; i < _lines.Count; i++)
         {
-            if (charIndex < _blocks[i].End)
+            if (charIndex < _lines[i].End)
             {
                 return i;
             }
         }
 
-        return _blocks.Count - 1;
+        return _lines.Count - 1;
     }
 
-    private void SetActiveBlock(int index)
+    private void SetActiveLine(int index)
     {
-        if (_activeBlock >= 0 && _activeBlock < _blocks.Count)
+        if (_activeLine >= 0 && _activeLine < _lines.Count)
         {
-            _blocks[_activeBlock].Element.Background = Brushes.Transparent;
-            _blocks[_activeBlock].Element.Foreground = NormalForeground;
+            var previous = _lines[_activeLine];
+            previous.Element.Background = Brushes.Transparent;
+            previous.Element.Foreground = NormalForeground;
         }
 
-        _activeBlock = index;
-        if (index < 0 || index >= _blocks.Count)
+        _activeLine = index;
+        if (index < 0 || index >= _lines.Count)
         {
             return;
         }
 
-        var block = _blocks[index];
-        block.Element.Background = ActiveBackground;
-        block.Element.Foreground = ActiveForeground;
+        var line = _lines[index];
+        line.Element.Background = ActiveBackground;
+        line.Element.Foreground = ActiveForeground;
 
-        // 用户刚手动滚过就不抢滚动条，避免"你滚你的它滚它的"
+        // 用户刚手动滚过就不抢滚动条
         if (Environment.TickCount64 - _lastUserScrollAt > 3000)
         {
-            block.Element.BringIntoView();
+            line.Element.BringIntoView();
         }
     }
 

@@ -78,7 +78,6 @@ public partial class App : System.Windows.Application
         _board = new Ui.ReaderBoardWindow(_settings, _reader);
 
         _tray.ToggleWatchRequested += () => SetWatching(!_watching, persist: true);
-        _tray.StopRequested += () => _reader.Stop();
         _tray.ExitRequested += Shutdown;
         _tray.ToggleBoardRequested += () =>
         {
@@ -86,6 +85,9 @@ public partial class App : System.Windows.Application
             _tray.SetBoardVisible(_board.IsBoardVisible);
         };
         _tray.SettingsRequested += OpenSettings;
+
+        // 板子上的"停止/启动"就是总开关，和热键同一个入口
+        _board.ToggleMaster += () => SetWatching(!_watching, persist: true);
 
         _hotkeys.Pressed += actionId => Dispatcher.Invoke(() =>
         {

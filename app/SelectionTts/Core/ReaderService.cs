@@ -26,18 +26,19 @@ public sealed record ReadState(
     double DurationSeconds,
     string? Error,
     int SynthChars,
+    int SynthTotal,
     bool SynthesisDone)
 {
     public double Progress => CharCount <= 0
         ? 0
         : Math.Clamp(CharIndex / (double)CharCount, 0, 1);
 
-    /// <summary>引擎已经合成到全文字数的百分之多少。进度条只表示这个。</summary>
+    /// <summary>引擎已经合成到本次朗读内容的百分之多少。进度条只表示这个。</summary>
     public double SynthesisProgress => SynthesisDone
         ? 1
-        : CharCount <= 0
+        : SynthTotal <= 0
             ? 0
-            : Math.Clamp(SynthChars / (double)CharCount, 0, 1);
+            : Math.Clamp(SynthChars / (double)SynthTotal, 0, 1);
 
     public double RemainingSeconds => Math.Max(0, DurationSeconds - PositionSeconds);
 
@@ -81,6 +82,7 @@ public sealed class ReaderService : IDisposable
     private string? _error;
     private int _charIndex;
     private int _synthChars;
+    private int _synthTotal;
     private bool _synthesisDone;
     private bool _feederDone;
     private double _positionFrozen;
@@ -135,6 +137,7 @@ public sealed class ReaderService : IDisposable
                 EstimateDurationLocked(),
                 _error,
                 _synthChars,
+                _synthTotal,
                 _synthesisDone);
         }
     }
@@ -159,35 +162,28 @@ public sealed class ReaderService : IDisposable
             Log.Info($"文本超过 {_settings.MaxChars} 字，截断朗读");
         }
 
-        Start(normalized, 0, 0);
+        Start(normalized, 0);
     }
 
-    /// <summary>从某一块开始重读（朗读板上点某一块触发）。</summary>
+    /// <summary>从指定字符开始重读（朗读板上点某一行触发），精确到字。</summary>
     public void JumpTo(int charIndex)
     {
         string text;
-        int segmentIndex;
+        int from;
 
         lock (_gate)
         {
-            if (_text.Length == 0 || _runtime.Count == 0)
+            if (_text.Length == 0)
             {
                 return;
             }
 
             text = _text;
-            segmentIndex = 0;
-            for (var i = 0; i < _runtime.Count; i++)
-            {
-                if (_runtime[i].Segment.End > charIndex)
-                {
-                    segmentIndex = i;
-                    break;
-                }
-            }
+            from = Math.Clamp(charIndex, 0, _text.Length - 1);
         }
 
-        Start(text, segmentIndex, -1);
+        Log.Info($"跳转朗读：从第 {from} 字开始");
+        Start(text, from);
     }
 
     public void Pause()
@@ -271,10 +267,11 @@ public sealed class ReaderService : IDisposable
         RaiseStatus();
     }
 
-    private void Start(string text, int startSegment, int resetCharIndex)
+    private void Start(string text, int synthFrom)
     {
         int generation;
         CancellationToken token;
+        var from = Math.Clamp(synthFrom, 0, Math.Max(0, text.Length - 1));
 
         lock (_gate)
         {
@@ -289,8 +286,9 @@ public sealed class ReaderService : IDisposable
             _status = ReadStatus.Preparing;
             _feederDone = false;
             _positionFrozen = 0;
-            _charIndex = Math.Max(0, resetCharIndex);
+            _charIndex = from;
             _synthChars = 0;
+            _synthTotal = Math.Max(1, text.Length - from);
             _synthesisDone = false;
             _speakStartedAt = Environment.TickCount64;
         }
@@ -298,20 +296,27 @@ public sealed class ReaderService : IDisposable
         _player.Stop();
         RaiseStatus();
 
-        Task.Run(() => WorkerAsync(generation, text, startSegment, token), token);
+        Task.Run(() => WorkerAsync(generation, text, from, token), token);
     }
 
-    private async Task WorkerAsync(int generation, string text, int startSegment, CancellationToken token)
+    private async Task WorkerAsync(int generation, string text, int synthFrom, CancellationToken token)
     {
         var watch = Stopwatch.StartNew();
-        var segments = TextSegmenter.Split(text);
+
+        // 从指定字符开始时，只把后半段切块合成；分段起点偏移回全文坐标
+        var body = synthFrom > 0 && synthFrom < text.Length ? text[synthFrom..] : text;
+        var baseOffset = text.Length - body.Length;
+
+        var segments = TextSegmenter.Split(body)
+            .Select(segment => new TextSegment(segment.Index, baseOffset + segment.Start, segment.Length, segment.Text))
+            .ToList();
+
         if (segments.Count == 0)
         {
             Fail(generation, new InvalidOperationException("没有可朗读的文本"));
             return;
         }
 
-        var target = Math.Clamp(startSegment, 0, segments.Count - 1);
         var runtime = segments.Select(segment => new SegmentRuntime { Segment = segment }).ToList();
 
         var channel = Channel.CreateUnbounded<SynthChunk>(new UnboundedChannelOptions
@@ -329,11 +334,8 @@ public sealed class ReaderService : IDisposable
             }
 
             _runtime = runtime;
-            if (target > 0)
-            {
-                _charIndex = runtime[target].Segment.Start;
-            }
-
+            _charIndex = baseOffset;
+            _synthTotal = Math.Max(1, text.Length - baseOffset);
             playerGeneration = _player.Begin();
         }
 
@@ -342,7 +344,7 @@ public sealed class ReaderService : IDisposable
 
         try
         {
-            for (var i = target; i < runtime.Count; i++)
+            for (var i = 0; i < runtime.Count; i++)
             {
                 token.ThrowIfCancellationRequested();
                 if (IsStale(generation))

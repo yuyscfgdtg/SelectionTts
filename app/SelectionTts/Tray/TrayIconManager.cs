@@ -26,7 +26,6 @@ public sealed class TrayIconManager : IDisposable
     private string _status = "待命";
 
     public event Action? ExitRequested;
-    public event Action? StopRequested;
     public event Action? ToggleWatchRequested;
     public event Action? ToggleBoardRequested;
     public event Action? SettingsRequested;
@@ -51,6 +50,7 @@ public sealed class TrayIconManager : IDisposable
 
         _boardItem = new ToolStripMenuItem
         {
+            Text = "显示朗读板",
             CheckOnClick = false,
             Checked = settings.BoardVisible,
         };
@@ -59,7 +59,6 @@ public sealed class TrayIconManager : IDisposable
         var menu = new ContextMenuStrip { ShowImageMargin = false };
         menu.Items.Add(_enabledItem);
         menu.Items.Add(_boardItem);
-        menu.Items.Add(new ToolStripMenuItem("停止朗读", null, (_, _) => StopRequested?.Invoke()));
         menu.Items.Add(new ToolStripSeparator());
         menu.Items.Add(BuildVoiceMenu());
         menu.Items.Add(BuildRateMenu());
