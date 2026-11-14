@@ -1,0 +1,65 @@
+name: 问题反馈
+description: 不朗读、跳转位置不对、卡住、崩溃等
+title: "[Bug] "
+labels: ["bug"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        感谢反馈。日志里不含你复制的内容，可以放心粘贴。
+
+  - type: textarea
+    id: what
+    attributes:
+      label: 发生了什么
+      description: 你做了什么操作、期望的结果、实际的结果
+      placeholder: |
+        1. 复制一段文字
+        2. 点了朗读板第 3 行
+        3. 期望从第 3 行读，实际从头开始读了
+    validations:
+      required: true
+
+  - type: input
+    id: version
+    attributes:
+      label: 版本
+      description: Release 标签或安装包名，例如 v1.0.0-beta
+    validations:
+      required: true
+
+  - type: dropdown
+    id: engine
+    attributes:
+      label: 语音引擎
+      options:
+        - Edge（默认）
+        - Azure（自定义 Key）
+        - 不确定
+    validations:
+      required: true
+
+  - type: input
+    id: os
+    attributes:
+      label: 系统版本
+      description: Windows 10 / 11，可用 winver 查看
+    validations:
+      required: false
+
+  - type: textarea
+    id: logs
+    attributes:
+      label: 日志片段（可选但很有用）
+      description: 打开 data\logs\app.log，把出问题前后十几行贴进来
+      render: text
+    validations:
+      required: false
+
+  - type: checkboxes
+    id: confirm
+    attributes:
+      label: 确认
+      options:
+        - label: 我看过 README 里的「已知限制」
+          required: true

@@ -4,6 +4,10 @@ Windows 10/11 托盘小工具：**复制文本，自动朗读**，并在一个�
 
 基于 Edge「大声朗读」同一个在线语音引擎（免费、无需 API Key），支持配置 Azure 语音作为备用引擎。
 
+> 🧪 **早期测试版**：功能和交互还会变。
+> 遇到问题、觉得哪里别扭、想要什么功能，都欢迎到 [Issues](https://github.com/yuyscfgdtg/SelectionTts/issues) 说一声。
+> 反馈时附上 `data\logs\app.log` 里相关的几行最好（日志只记字数，不记录复制的内容）。
+
 ![朗读板](docs/images/board.png)
 
 ## 特性
