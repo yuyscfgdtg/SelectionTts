@@ -60,6 +60,12 @@ public partial class App : System.Windows.Application
             return;
         }
 
+        if (e.Args.Contains("--selftest-autostart"))
+        {
+            RunAutoStartSelfTest();
+            return;
+        }
+
         _instanceMutex = new Mutex(true, @"Local\SelectionTts.SingleInstance", out var createdNew);
         if (!createdNew)
         {
@@ -383,6 +389,33 @@ public partial class App : System.Windows.Application
     /// <summary>
     /// 验证配置相关能力：DPAPI 加解密、热键注册/换绑/冲突回滚。
     /// </summary>
+    /// <summary>验证开机自启：开→关→复原，快捷方式随状态出现和消失。</summary>
+    private void RunAutoStartSelfTest()
+    {
+        try
+        {
+            var initial = AutoStart.IsEnabled;
+            Log.Info($"selftest autostart | 初始={initial} | 路径={AutoStart.ShortcutPath}");
+
+            AutoStart.Apply(true);
+            Log.Info($"selftest autostart 开启后 | 状态={AutoStart.IsEnabled} | 文件存在={File.Exists(AutoStart.ShortcutPath)}");
+
+            AutoStart.Apply(false);
+            Log.Info($"selftest autostart 关闭后 | 状态={AutoStart.IsEnabled} | 文件存在={File.Exists(AutoStart.ShortcutPath)}");
+
+            AutoStart.Apply(initial);
+            Log.Info($"selftest autostart 复原后 | 状态={AutoStart.IsEnabled}（初始为 {initial}）");
+        }
+        catch (Exception ex)
+        {
+            Log.Error("selftest autostart failed", ex);
+        }
+        finally
+        {
+            Shutdown(0);
+        }
+    }
+
     private async void RunConfigSelfTest()
     {
         try

@@ -1,25 +1,26 @@
-# Python-generated files
-__pycache__/
-*.py[oc]
-build/
-dist/
-wheels/
-*.egg-info
-
-# Virtual environments
-.venv
-
-# Local artifacts
-*.mp3
-*.wav
-logs/
-config.local.json
-.mypy_cache/
-.ruff_cache/
-.pytest_cache/
-
-# .NET build output
+# .NET 构建产物
 app/**/bin/
 app/**/obj/
+app/**/publish/
+app/**/installer/output/
+*.user
+
+# 运行时数据（设置、日志、缓存）
 app/**/data/
-publish/
+*.log
+
+# Python（Phase 0 原型，已移除，保留忽略规则以防本地残留）
+.venv/
+__pycache__/
+*.py[cod]
+.uv/
+
+# 编辑器 / 系统
+.vs/
+.idea/
+Thumbs.db
+.DS_Store
+
+# 媒体临时文件
+*.mp3
+*.wav

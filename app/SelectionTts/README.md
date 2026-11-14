@@ -117,6 +117,12 @@ Edge 出问题时板子状态行会变红显示「朗读失败」，托盘也会
 
 热键是模块化的（`Platform/HotkeyActions.cs`），以后要加「停止朗读」「显示朗读板」只需加一行动作定义。
 
+### 启动
+
+- **开机自动启动**：勾选后在当前用户的「启动」文件夹放一个快捷方式，登录后自动驻留托盘、不弹窗
+- 用的是快捷方式而不是注册表 Run 项：你可以自己删、任务管理器里看得见，和安装包用的是同一个文件，不会出现两份自启
+- 默认关闭，随时在设置里开关，不需要重装
+
 ## 数据目录
 
 优先使用 exe 旁边的 `data`（便携）；不可写时退回 `%LOCALAPPDATA%\SelectionTts`。
@@ -153,11 +159,37 @@ data\
 | `--selftest-stream` | 验证流式合成、首包延迟、时间戳条数 |
 | `--selftest-pipeline` | 验证分块流水线：首声、进度、抢占、停止 |
 | `--selftest-config` | 验证 DPAPI、热键注册/换绑/回滚、配置往返 |
+| `--selftest-autostart` | 验证开机自启快捷方式的创建与删除 |
+
+## 安装（一键安装包）
+
+```
+installer\output\SelectionTts-Setup-1.0.0.exe
+```
+
+双击即可安装，**不需要管理员权限**，默认装到 `%LOCALAPPDATA%\Programs\SelectionTts`。
+
+安装时可勾选：**开机自动启动**（默认勾选）、**桌面快捷方式**（默认不勾）。
+
+- 装完在开始菜单出现「剪贴板朗读」，托盘出现图标（默认灰色 = 已关闭）
+- 卸载在「设置 → 应用 → 已安装的应用」里，或运行安装目录的 `unins000.exe`
+- **卸载会保留 `data\`（设置和日志）**；只有你在卸载提示里选择"同时删除"才会清掉
+- 覆盖安装 = 升级，配置和位置都保留
+
+重新打包安装包：
+
+```powershell
+# 先出单文件 exe
+dotnet publish -c Release -r win-x64 --self-contained true -p:PublishSingleFile=true `
+  -p:IncludeNativeLibrariesForSelfExtract=true -p:EnableCompressionInSingleFile=true `
+  -o publish\win-x64
+# 再编安装包（Inno Setup 6）
+& "$env:LOCALAPPDATA\Programs\Inno Setup 6\ISCC.exe" installer\SelectionTts.iss
+```
 
 ## 构建
 
 需要 .NET SDK 10。
-
 ```powershell
 cd app\SelectionTts
 dotnet build -c Debug

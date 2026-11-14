@@ -60,6 +60,7 @@ public partial class SettingsWindow : Window
         EdgeRadio.IsChecked = !isAzure;
         RegionBox.Text = _settings.AzureRegion;
         KeyPassword.Password = Dpapi.Unprotect(_settings.AzureKeyProtected);
+        AutoStartCheck.IsChecked = AutoStart.IsEnabled;
     }
 
     private void UpdateAzurePanel() =>
@@ -291,6 +292,7 @@ public partial class SettingsWindow : Window
         }
 
         SettingsStore.Save(_settings);
+        AutoStart.Apply(AutoStartCheck.IsChecked == true);
         Saved = true;
         Close();
     }
