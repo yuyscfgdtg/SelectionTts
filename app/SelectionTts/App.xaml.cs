@@ -234,7 +234,12 @@ public partial class App : System.Windows.Application
         {
             _settings.WatchEnabled = on;
             SettingsStore.Save(_settings);
-            _tray.Notify(on ? "已启用朗读：复制文本即朗读" : "已关闭朗读");
+
+            // 板子看得见的时候它已经显示状态了，再弹气泡只会挡住板子
+            if (_board is null || !_board.IsBoardVisible)
+            {
+                _tray.Notify(on ? "已启用朗读：复制文本即朗读" : "已关闭朗读");
+            }
         }
     }
 
