@@ -2,7 +2,7 @@
 
 Windows 10/11 的划词朗读原型。Phase 0 先用 Python + PySide6 验证取词、Edge TTS 音质/延迟和托盘交互，确认后再用 C# 重写正式版。
 
-当前进度：**D1–D6 完成**。取词优先走 UI Automation，失败再回退 Ctrl+C；全局快捷键、划词弹窗、通用场景矩阵、全屏/进程排除都已验证。下一步是 D7 指标汇总与 go/no-go。
+当前进度：**D1–D7 完成，Phase 0 通过（go）**。取词优先走 UI Automation，失败再回退 Ctrl+C；全局快捷键、划词弹窗、通用场景矩阵、全屏/进程排除、朗读打断都已验证。下一步是按 `docs\d7-report.md` 的要求用 C# 重写正式版。
 
 ## 环境要求
 
@@ -53,9 +53,7 @@ uv run selection-tts
 9. 全屏或游戏窗口里自动暂停弹窗；`excluded_processes` 中的程序既不弹窗也不响应热键。
 10. 朗读中再次划词或按热键会立即打断当前朗读，直接开始新的内容，无需先点「停止」。
 
-Phase 0 暂未接入：
-
-- 全屏/游戏自动暂停（D6）
+Phase 0 结论（`docs\d7-report.md`）：26 次朗读全部成功，弹窗取词中位数 9ms，UIA 覆盖 69%；短文本合成 p50 1.6s。唯一要带到正式版解决的是长文本合成等待——1410 字需要 12.6s，正式版改为分段流水线播放。
 
 ## 配置
 
@@ -97,6 +95,7 @@ Phase 0 暂未接入：
 - 弹窗显示期间不会抢焦点，但需要目标窗口本身支持 `Ctrl+C` 复制选区。
 - 剪贴板恢复是尽力而为：文本、HTML、RTF 等全局内存格式可恢复，GDI 句柄类格式（部分图片）暂不恢复。
 - Edge TTS 是非官方接口，可能限流或变更；正式版会加 Azure 引擎和本地引擎兜底。
+- 长文本要等整段合成完才出声：1410 字约 12.6s，期间只有「正在合成…」提示。正式版改为按句分段、边合成边播放。
 - Phase 0 从终端启动时带控制台窗口；正式版会改为无控制台托盘程序。
 
 ## 验证脚本
@@ -117,12 +116,17 @@ uv run python scripts\probe_hotkey_uia.py  # D4：热键→UIA→朗读端到端
 uv run python scripts\probe_matrix.py      # D5：通用场景矩阵（记事本/浏览器/终端/Office/PDF）
 uv run python scripts\probe_guard.py       # D6：全屏检测与进程排除
 uv run python scripts\probe_pause.py       # D6：全屏窗口不弹窗（需托盘程序运行）
+uv run python scripts\probe_interrupt.py   # D7：新朗读请求打断旧朗读（静音，不发声）
 ```
 
 `probe_matrix.py` 只取词不播放，可只跑单个场景，例如 `uv run python scripts\probe_matrix.py excel`。
 
 ## 下一步
 
-- D7：指标汇总与 go/no-go
+Phase 0 结束，进入 C# 正式版重写：
 
-详细记录见 `docs/d2-report.md`、`docs/d3-report.md`、`docs/d4-report.md`、`docs/d5-report.md`、`docs/d6-report.md`。
+- 按 `docs/d7-report.md` 的“对 C# 正式版的要求”建项目骨架
+- 先跑通「热键 → UIA/剪贴板 → Edge TTS 流式 → 播放」主线
+- 再补无焦点浮窗、托盘、设置界面、打包单文件 exe
+
+详细记录见 `docs/d2-report.md`、`docs/d3-report.md`、`docs/d4-report.md`、`docs/d5-report.md`、`docs/d6-report.md`、`docs/d7-report.md`。
