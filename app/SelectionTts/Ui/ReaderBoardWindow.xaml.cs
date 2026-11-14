@@ -47,6 +47,9 @@ public partial class ReaderBoardWindow : Window
     private static readonly Brush DotPaused =
         Freeze(new SolidColorBrush(Color.FromRgb(0xF5, 0xA5, 0x24)));
 
+    private static readonly Brush DotPreparing =
+        Freeze(new SolidColorBrush(Color.FromRgb(0x60, 0xA5, 0xFA)));
+
     private static readonly Brush DotFailed =
         Freeze(new SolidColorBrush(Color.FromRgb(0xEF, 0x44, 0x44)));
 
@@ -170,14 +173,19 @@ public partial class ReaderBoardWindow : Window
 
         var state = _reader.GetState();
 
-        PauseButton.IsEnabled = state.Status is ReadStatus.Playing or ReadStatus.Paused;
+        PauseButton.IsEnabled = state.Status
+            is ReadStatus.Preparing or ReadStatus.Playing or ReadStatus.Paused;
         StopButton.IsEnabled = state.Status
             is ReadStatus.Preparing or ReadStatus.Playing or ReadStatus.Paused;
         PauseButton.Content = state.Status == ReadStatus.Paused ? "继续" : "暂停";
 
-        StatusText.Text = state.StatusText;
+        StatusText.Text = state.Status == ReadStatus.Preparing
+            ? $"正在合成 {(int)Math.Round(state.SynthesisProgress * 100)}%"
+            : state.StatusText;
+
         StatusDot.Fill = state.Status switch
         {
+            ReadStatus.Preparing => DotPreparing,
             ReadStatus.Playing => DotLive,
             ReadStatus.Completed => DotLive,
             ReadStatus.Paused => DotPaused,
@@ -198,18 +206,34 @@ public partial class ReaderBoardWindow : Window
             RebuildBlocks(state.Text);
         }
 
-        var remaining = TimeSpan.FromSeconds(state.RemainingSeconds);
-        MetaText.Text = remaining.TotalHours >= 1
-            ? $"{state.CharIndex}/{state.CharCount} 字 · 剩余 {remaining:hh\\:mm\\:ss}"
-            : $"{state.CharIndex}/{state.CharCount} 字 · 剩余 {remaining:mm\\:ss}";
+        MetaText.Text = state.Status switch
+        {
+            ReadStatus.Preparing => $"已合成 {state.SynthChars}/{state.CharCount} 字",
+            ReadStatus.Completed => $"共 {state.CharCount} 字",
+            ReadStatus.Failed => state.Error ?? "",
+            _ => $"剩余 {FormatSeconds(state.RemainingSeconds)}",
+        };
 
-        ProgressFill.Width = Math.Max(0, ProgressTrack.ActualWidth * state.Progress);
+        // 进度条只表示"引擎合成到哪了"；合成结束就收起，朗读进度交给高亮。
+        var showBar = !state.SynthesisDone &&
+                      state.Status is ReadStatus.Preparing or ReadStatus.Playing;
+        ProgressFill.Width = showBar
+            ? Math.Max(0, ProgressTrack.ActualWidth * state.SynthesisProgress)
+            : 0;
 
         var index = FindBlockIndex(state.CharIndex);
         if (index != _activeBlock)
         {
             SetActiveBlock(index);
         }
+    }
+
+    private static string FormatSeconds(double seconds)
+    {
+        var span = TimeSpan.FromSeconds(Math.Max(0, seconds));
+        return span.TotalHours >= 1
+            ? $"{(int)span.TotalHours}:{span.Minutes:00}:{span.Seconds:00}"
+            : $"{span.Minutes:00}:{span.Seconds:00}";
     }
 
     private void RenderDisabled()
@@ -243,7 +267,7 @@ public partial class ReaderBoardWindow : Window
         _blocks.Clear();
         BlocksPanel.Children.Clear();
 
-        foreach (var block in TextSegmenter.SplitDisplayBlocks(text))
+        foreach (var block in TextSegmenter.SplitParagraphs(text))
         {
             var element = new TextBlock
             {
