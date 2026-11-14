@@ -1,5 +1,4 @@
 using System.Diagnostics;
-using System.Threading.Channels;
 using SelectionTts.Audio;
 using SelectionTts.Tts;
 
@@ -33,7 +32,7 @@ public sealed record ReadState(
         ? 0
         : Math.Clamp(CharIndex / (double)CharCount, 0, 1);
 
-    /// <summary>引擎已经合成到本次朗读内容的百分之多少。进度条只表示这个。</summary>
+    /// <summary>全文里已经合成（缓存好）的比例。进度条只表示这个。</summary>
     public double SynthesisProgress => SynthesisDone
         ? 1
         : SynthTotal <= 0
@@ -48,20 +47,23 @@ public sealed record ReadState(
 }
 
 /// <summary>
-/// 朗读编排：文本 → 切块 → 流式合成 → 连续播放。
+/// 朗读编排：一句一段做缓存，像流媒体那样"边缓冲边播放"。
 ///
-/// 合成和写入是解耦的两条腿：合成好的块丢进队列，写入线程按顺序喂给播放缓冲。
-/// 这样合成可以跑在播放前面，块与块之间不会因为"等解码/等合成"出现停顿，
-/// 每块的长度也在入队时就记好了，进度条立刻能算。
-///
-/// 新文本直接顶掉旧文本（取消合成、停音频、重置时间轴）。
+/// - 复制后从第 1 句开始合成，合成好的句子进缓存
+/// - 播放头按句子顺序取缓存，命中即播，没命中就等这一句合成完（最多一句的等待）
+/// - 点某一行 = seek 到那一行所在句子：已缓存秒开，未缓存就让合成器优先做这一句
+/// - 读到结尾就算读完；剩下没合成的句子在后台补齐（不朗读），进度条补到 100%
+/// - 换新文本时整块丢弃旧缓存，内存里只保留当前这一段文本
 /// </summary>
 public sealed class ReaderService : IDisposable
 {
     private sealed class SegmentRuntime
     {
-        public TextSegment Segment;
+        public TextSegment Segment = default;
         public List<WordSpan> Words = [];
+        public TaskCompletionSource<byte[]> Ready = new(TaskCreationOptions.RunContinuationsAsynchronously);
+        public byte[]? Mp3;
+        public double DurationSeconds;
         public long StartPcmBytes;
         public long PcmBytes;
     }
@@ -69,24 +71,29 @@ public sealed class ReaderService : IDisposable
     private readonly record struct WordSpan(int End, double StartSeconds);
 
     private readonly AppSettings _settings;
-    private ISpeechSynthesizer _engine;
     private readonly StreamingAudioPlayer _player = new();
     private readonly object _gate = new();
     private readonly System.Threading.Timer _timer;
 
-    private int _generation;
-    private CancellationTokenSource? _cts;
+    private ISpeechSynthesizer _engine;
+
+    private int _generation;          // 文本级：换文本就 +1
+    private int _session;             // 播放级：每次 seek 就 +1
+    private CancellationTokenSource? _cts;         // 文本级取消
+    private CancellationTokenSource? _sessionCts;  // 播放级取消
+
     private string _text = "";
-    private List<SegmentRuntime> _runtime = [];
+    private List<SegmentRuntime> _plan = [];
     private ReadStatus _status = ReadStatus.Idle;
     private string? _error;
     private int _charIndex;
-    private int _synthChars;
-    private int _synthTotal;
-    private bool _synthesisDone;
+    private int _sessionStart;
     private bool _feederDone;
     private double _positionFrozen;
     private long _speakStartedAt;
+
+    private int _jumpTarget = -1;   // 合成器优先处理这一句
+    private int _synthCursor;       // 顺序合成指针
 
     public ReaderService(AppSettings settings, ISpeechSynthesizer? engine = null)
     {
@@ -110,6 +117,9 @@ public sealed class ReaderService : IDisposable
         _ => "",
     };
 
+    /// <summary>切换合成引擎，下一条朗读生效（正在朗读的那条不受影响）。</summary>
+    public void SetEngine(ISpeechSynthesizer engine) => _engine = engine;
+
     public ReadState GetState()
     {
         lock (_gate)
@@ -124,6 +134,21 @@ public sealed class ReaderService : IDisposable
                 _charIndex = _text.Length;
             }
 
+            var synthChars = 0;
+            var done = _plan.Count > 0;
+
+            foreach (var item in _plan)
+            {
+                if (item.Mp3 is not null)
+                {
+                    synthChars += item.Segment.Length;
+                }
+                else
+                {
+                    done = false;
+                }
+            }
+
             var position = _status is ReadStatus.Preparing or ReadStatus.Playing or ReadStatus.Paused
                 ? _player.PositionSeconds
                 : _positionFrozen;
@@ -136,16 +161,13 @@ public sealed class ReaderService : IDisposable
                 position,
                 EstimateDurationLocked(),
                 _error,
-                _synthChars,
-                _synthTotal,
-                _synthesisDone);
+                synthChars,
+                _text.Length,
+                done);
         }
     }
 
-    /// <summary>切换合成引擎，下一条朗读生效（正在朗读的那条不受影响）。</summary>
-    public void SetEngine(ISpeechSynthesizer engine) => _engine = engine;
-
-    /// <summary>新的朗读目标。整篇替换，旧的一律作废。</summary>
+    /// <summary>新的朗读目标。整篇替换，旧缓存立即丢弃。</summary>
     public void Speak(string text)
     {
         var (normalized, truncated) = TextUtil.Truncate(
@@ -162,28 +184,47 @@ public sealed class ReaderService : IDisposable
             Log.Info($"文本超过 {_settings.MaxChars} 字，截断朗读");
         }
 
-        Start(normalized, 0);
+        StartNew(normalized);
     }
 
-    /// <summary>从指定字符开始重读（朗读板上点某一行触发），精确到字。</summary>
+    /// <summary>seek 到某一行：落到这一行所在句子的开头。</summary>
     public void JumpTo(int charIndex)
     {
-        string text;
-        int from;
+        int generation;
+        int session;
+        int startIndex;
+        CancellationToken token;
 
         lock (_gate)
         {
-            if (_text.Length == 0)
+            if (_text.Length == 0 || _plan.Count == 0)
             {
                 return;
             }
 
-            text = _text;
-            from = Math.Clamp(charIndex, 0, _text.Length - 1);
+            var sentenceStart = TextSegmenter.SentenceStart(_text, charIndex);
+            startIndex = FindSegmentLocked(sentenceStart);
+            if (startIndex < 0)
+            {
+                return;
+            }
+
+            _jumpTarget = startIndex;
+            _charIndex = sentenceStart;
+            _positionFrozen = 0;
+            session = ++_session;
+            _sessionCts?.Cancel();
+            _sessionCts = new CancellationTokenSource();
+            token = _sessionCts.Token;
+            generation = _generation;
+            _status = _plan[startIndex].Mp3 is null ? ReadStatus.Preparing : ReadStatus.Playing;
         }
 
-        Log.Info($"跳转朗读：从第 {from} 字开始");
-        Start(text, from);
+        _player.Stop();
+        Log.Info($"seek：第 {startIndex + 1}/{_plan.Count} 句起朗读");
+        RaiseStatus();
+
+        _ = Task.Run(() => PlaybackLoopAsync(generation, session, startIndex, token), token);
     }
 
     public void Pause()
@@ -212,7 +253,7 @@ public sealed class ReaderService : IDisposable
                 return;
             }
 
-            _status = _synthesisDone ? ReadStatus.Playing : ReadStatus.Preparing;
+            _status = ReadStatus.Playing;
         }
 
         _player.Resume();
@@ -220,7 +261,7 @@ public sealed class ReaderService : IDisposable
         RaiseStatus();
     }
 
-    /// <summary>停止播放，保留文本和当前位置（方便在板上回看）。</summary>
+    /// <summary>停止播放，保留文本和缓存。</summary>
     public void Stop()
     {
         lock (_gate)
@@ -233,9 +274,9 @@ public sealed class ReaderService : IDisposable
             UpdateCharIndexLocked();
             _positionFrozen = _player.PositionSeconds;
             _status = ReadStatus.Stopped;
-            _generation++;
-            _cts?.Cancel();
-            _cts = null;
+            _session++;
+            _sessionCts?.Cancel();
+            _sessionCts = null;
             _feederDone = true;
         }
 
@@ -244,7 +285,7 @@ public sealed class ReaderService : IDisposable
         RaiseStatus();
     }
 
-    /// <summary>总开关关闭：停止 + 释放文本（内存里不留副本）。</summary>
+    /// <summary>总开关关闭：停止 + 丢弃文本与全部音频缓存。</summary>
     public void Clear()
     {
         lock (_gate)
@@ -252,14 +293,19 @@ public sealed class ReaderService : IDisposable
             _generation++;
             _cts?.Cancel();
             _cts = null;
+            _session++;
+            _sessionCts?.Cancel();
+            _sessionCts = null;
+
             _text = "";
-            _runtime = [];
+            _plan = [];
             _charIndex = 0;
-            _synthChars = 0;
-            _synthesisDone = false;
             _error = null;
             _feederDone = true;
             _positionFrozen = 0;
+            _jumpTarget = -1;
+            _synthCursor = 0;
+            _sessionStart = 0;
             _status = ReadStatus.Idle;
         }
 
@@ -267,65 +313,44 @@ public sealed class ReaderService : IDisposable
         RaiseStatus();
     }
 
-    private void Start(string text, int synthFrom)
+    private void StartNew(string text)
     {
         int generation;
         CancellationToken token;
-        var from = Math.Clamp(synthFrom, 0, Math.Max(0, text.Length - 1));
+        List<SegmentRuntime> plan;
 
         lock (_gate)
         {
-            generation = ++_generation;
+            // 整块丢弃旧缓存
+            _generation++;
             _cts?.Cancel();
             _cts = new CancellationTokenSource();
             token = _cts.Token;
+            generation = _generation;
+
+            _session++;
+            _sessionCts?.Cancel();
+            _sessionCts = null;
 
             _text = text;
-            _runtime = [];
+            _plan = [];
             _error = null;
             _status = ReadStatus.Preparing;
             _feederDone = false;
             _positionFrozen = 0;
-            _charIndex = from;
-            _synthChars = 0;
-            _synthTotal = Math.Max(1, text.Length - from);
-            _synthesisDone = false;
+            _charIndex = 0;
+            _jumpTarget = -1;
+            _synthCursor = 0;
+            _sessionStart = 0;
             _speakStartedAt = Environment.TickCount64;
         }
 
         _player.Stop();
-        RaiseStatus();
 
-        Task.Run(() => WorkerAsync(generation, text, from, token), token);
-    }
-
-    private async Task WorkerAsync(int generation, string text, int synthFrom, CancellationToken token)
-    {
-        var watch = Stopwatch.StartNew();
-
-        // 从指定字符开始时，只把后半段切块合成；分段起点偏移回全文坐标
-        var body = synthFrom > 0 && synthFrom < text.Length ? text[synthFrom..] : text;
-        var baseOffset = text.Length - body.Length;
-
-        var segments = TextSegmenter.Split(body)
-            .Select(segment => new TextSegment(segment.Index, baseOffset + segment.Start, segment.Length, segment.Text))
+        plan = TextSegmenter.SplitSentences(text)
+            .Select(segment => new SegmentRuntime { Segment = segment })
             .ToList();
 
-        if (segments.Count == 0)
-        {
-            Fail(generation, new InvalidOperationException("没有可朗读的文本"));
-            return;
-        }
-
-        var runtime = segments.Select(segment => new SegmentRuntime { Segment = segment }).ToList();
-
-        var channel = Channel.CreateUnbounded<SynthChunk>(new UnboundedChannelOptions
-        {
-            SingleReader = true,
-            SingleWriter = true,
-        });
-
-        int playerGeneration;
         lock (_gate)
         {
             if (generation != _generation)
@@ -333,135 +358,143 @@ public sealed class ReaderService : IDisposable
                 return;
             }
 
-            _runtime = runtime;
-            _charIndex = baseOffset;
-            _synthTotal = Math.Max(1, text.Length - baseOffset);
-            playerGeneration = _player.Begin();
+            _plan = plan;
         }
 
-        var writer = Task.Run(() => WriterLoopAsync(playerGeneration, channel.Reader, token), token);
-        long firstAudioAt = -1;
+        if (plan.Count == 0)
+        {
+            Fail(generation, new InvalidOperationException("没有可朗读的文本"));
+            return;
+        }
+
+        Log.Info($"开始朗读 {text.Length} 字 | {plan.Count} 句 | 引擎={_engine.Name}");
+        RaiseStatus();
+
+        _ = Task.Run(() => SynthesisLoopAsync(generation, token), token);
+        JumpToStart(generation);
+    }
+
+    private void JumpToStart(int generation)
+    {
+        int session;
+        CancellationToken token;
+
+        lock (_gate)
+        {
+            if (generation != _generation || _plan.Count == 0)
+            {
+                return;
+            }
+
+            session = ++_session;
+            _sessionCts?.Cancel();
+            _sessionCts = new CancellationTokenSource();
+            token = _sessionCts.Token;
+        }
+
+        _ = Task.Run(() => PlaybackLoopAsync(generation, session, 0, token), token);
+    }
+
+    /// <summary>合成器：优先补 seek 目标，然后顺序往后，到结尾后回头补空洞。</summary>
+    private async Task SynthesisLoopAsync(int generation, CancellationToken token)
+    {
+        var watch = Stopwatch.StartNew();
 
         try
         {
-            for (var i = 0; i < runtime.Count; i++)
+            while (!token.IsCancellationRequested)
             {
-                token.ThrowIfCancellationRequested();
-                if (IsStale(generation))
-                {
-                    return;
-                }
-
-                var item = runtime[i];
-                var synthesized = await SynthesizeAsync(item.Segment.Text, token);
-                if (IsStale(generation))
-                {
-                    return;
-                }
-
-                item.Words = BuildWordSpans(item.Segment.Text, synthesized.Boundaries);
-
-                // 音频以 MP3 形式排队，写入线程再解码：合成不会被播放拖慢，
-                // 进度条才能在二十来秒内爬满，而不是跟着声音慢慢挪。
-                await channel.Writer.WriteAsync(new SynthChunk(item, synthesized.Audio), token);
+                int index;
+                SegmentRuntime item;
+                int total;
 
                 lock (_gate)
                 {
-                    if (generation == _generation)
+                    if (generation != _generation)
                     {
-                        _synthChars += item.Segment.Length;
+                        return;
                     }
+
+                    index = TakeNextIndexLocked();
+                    if (index < 0)
+                    {
+                        break;
+                    }
+
+                    item = _plan[index];
+                    total = _plan.Count;
                 }
 
-                if (firstAudioAt < 0)
+                var synthesized = await SynthesizeAsync(item.Segment.Text, token);
+
+                lock (_gate)
                 {
-                    firstAudioAt = watch.ElapsedMilliseconds;
+                    if (generation != _generation)
+                    {
+                        return;
+                    }
+
+                    item.Words = BuildWordSpans(item.Segment.Text, synthesized.Boundaries);
+                    item.Mp3 = synthesized.Audio;
+                    item.DurationSeconds = synthesized.Audio.Length * 8d / 48_000d;
                 }
+
+                item.Ready.TrySetResult(synthesized.Audio);
 
                 Log.Info(
-                    $"分块 {i + 1}/{runtime.Count} | {item.Segment.Length} 字 | " +
-                    $"合成={synthesized.ElapsedMs}ms | 音频≈{synthesized.Audio.Length * 8d / 48_000d:F2}s | " +
-                    $"时间戳={synthesized.Boundaries.Count}");
+                    $"合成 {index + 1}/{total} 句 | {item.Segment.Length} 字 | " +
+                    $"{synthesized.ElapsedMs}ms | 音频≈{item.DurationSeconds:F2}s");
             }
 
-            channel.Writer.TryComplete();
-
-            lock (_gate)
-            {
-                if (generation == _generation)
-                {
-                    _synthesisDone = true;
-                    if (_status == ReadStatus.Preparing)
-                    {
-                        _status = ReadStatus.Playing;
-                    }
-                }
-            }
-
-            RaiseStatus();
-            Log.Info(
-                $"合成完成 | {text.Length} 字 | 分块={runtime.Count} | 首声={firstAudioAt}ms | " +
-                $"耗时={watch.ElapsedMilliseconds}ms | 引擎={_engine.Name}");
-
-            // 等所有音频写进缓冲（缓冲只有 10 秒，所以这里会随播放推进而逐步完成）
-            await writer;
-
-            _player.MarkFeederDone();
-            lock (_gate)
-            {
-                if (generation == _generation)
-                {
-                    _feederDone = true;
-                }
-            }
+            Log.Info($"合成完成 | 全程 {watch.ElapsedMilliseconds}ms | 引擎={_engine.Name}");
         }
         catch (OperationCanceledException)
         {
-            Log.Info("朗读已取消");
+            Log.Info("合成已取消");
         }
         catch (Exception ex)
         {
-            if (!IsStale(generation))
+            if (generation == _generation)
             {
                 Fail(generation, ex);
             }
         }
-        finally
-        {
-            channel.Writer.TryComplete();
-        }
     }
 
-    private sealed record SynthChunk(SegmentRuntime Item, byte[] Mp3);
-
-    private async Task WriterLoopAsync(int playerGeneration, ChannelReader<SynthChunk> reader, CancellationToken token)
+    private int TakeNextIndexLocked()
     {
-        long cursor = 0;
+        var count = _plan.Count;
 
-        try
+        if (_jumpTarget >= 0 && _jumpTarget < count && _plan[_jumpTarget].Mp3 is null)
         {
-            while (await reader.WaitToReadAsync(token).ConfigureAwait(false))
+            var jump = _jumpTarget;
+            _jumpTarget = -1;
+            _synthCursor = jump;
+            return jump;
+        }
+
+        _jumpTarget = -1;
+
+        for (var i = _synthCursor; i < count; i++)
+        {
+            if (_plan[i].Mp3 is null)
             {
-                while (reader.TryRead(out var chunk))
-                {
-                    var pcm = StreamingAudioPlayer.DecodeMp3(chunk.Mp3);
-
-                    // 记账在真正写入前完成：播放位置立刻能映射回这一段的原文范围
-                    lock (_gate)
-                    {
-                        chunk.Item.StartPcmBytes = cursor;
-                        chunk.Item.PcmBytes = pcm.Length;
-                    }
-
-                    cursor += pcm.Length;
-                    await _player.WritePcmAsync(pcm, playerGeneration, token).ConfigureAwait(false);
-                }
+                _synthCursor = i;
+                return i;
             }
         }
-        catch (OperationCanceledException)
+
+        // 已经合成到结尾，回头补前面没合成的
+        for (var i = 0; i < Math.Min(_synthCursor, count); i++)
         {
-            // 抢占/停止时的正常路径
+            if (_plan[i].Mp3 is null)
+            {
+                _synthCursor = i;
+                return i;
+            }
         }
+
+        return -1;
     }
 
     private readonly record struct Synthesized(byte[] Audio, List<SpeechBoundary> Boundaries, int ElapsedMs);
@@ -482,49 +515,107 @@ public sealed class ReaderService : IDisposable
         return new Synthesized(audio.ToArray(), boundaries, summary.ElapsedMs);
     }
 
-    /// <summary>
-    /// 把服务端返回的词时间戳对齐到原文字符位置。
-    /// 服务端会对数字/单位做规范化（"2024" 念成"二零二四"），对不上就退回游标，
-    /// 只损失这一处精度，不会导致整体错位。
-    /// </summary>
-    private static List<WordSpan> BuildWordSpans(string text, List<SpeechBoundary> boundaries)
+    /// <summary>播放会话：从第 startIndex 句开始，顺序取缓存喂给播放缓冲。</summary>
+    private async Task PlaybackLoopAsync(int generation, int session, int startIndex, CancellationToken token)
     {
-        var spans = new List<WordSpan>(boundaries.Count);
-        var cursor = 0;
+        List<SegmentRuntime> plan;
+        int playerGeneration;
 
-        foreach (var boundary in boundaries)
+        lock (_gate)
         {
-            var word = boundary.Text ?? "";
-            var start = cursor;
-
-            if (word.Length > 0)
+            if (generation != _generation || session != _session)
             {
-                var found = cursor < text.Length
-                    ? text.IndexOf(word, cursor, StringComparison.Ordinal)
-                    : -1;
-
-                if (found < 0)
-                {
-                    found = text.IndexOf(word, StringComparison.Ordinal);
-                }
-
-                if (found >= 0)
-                {
-                    start = found;
-                }
+                return;
             }
 
-            var end = Math.Min(text.Length, start + word.Length);
-            spans.Add(new WordSpan(end, boundary.OffsetSeconds));
-            cursor = Math.Max(cursor, end);
+            plan = _plan;
+            if (startIndex >= plan.Count)
+            {
+                return;
+            }
+
+            foreach (var item in plan)
+            {
+                item.StartPcmBytes = 0;
+                item.PcmBytes = 0;
+            }
+
+            _sessionStart = startIndex;
+            _feederDone = false;
+            _charIndex = plan[startIndex].Segment.Start;
+            playerGeneration = _player.Begin();
         }
 
-        return spans;
+        var watch = Stopwatch.StartNew();
+        long cursor = 0;
+        long firstAudioAt = -1;
+
+        try
+        {
+            for (var i = startIndex; i < plan.Count; i++)
+            {
+                token.ThrowIfCancellationRequested();
+
+                var mp3 = await plan[i].Ready.Task.WaitAsync(token);
+                if (IsStale(generation, session))
+                {
+                    return;
+                }
+
+                var pcm = StreamingAudioPlayer.DecodeMp3(mp3);
+
+                lock (_gate)
+                {
+                    if (generation != _generation || session != _session)
+                    {
+                        return;
+                    }
+
+                    plan[i].StartPcmBytes = cursor;
+                    plan[i].PcmBytes = pcm.Length;
+
+                    if (firstAudioAt < 0 && _status == ReadStatus.Preparing)
+                    {
+                        _status = ReadStatus.Playing;
+                    }
+                }
+
+                if (firstAudioAt < 0)
+                {
+                    firstAudioAt = watch.ElapsedMilliseconds;
+                    Log.Info($"首声={firstAudioAt}ms | 从第 {startIndex + 1} 句开始");
+                    RaiseStatus();
+                }
+
+                cursor += pcm.Length;
+                await _player.WritePcmAsync(pcm, playerGeneration, token);
+            }
+
+            _player.MarkFeederDone();
+            lock (_gate)
+            {
+                if (generation == _generation && session == _session)
+                {
+                    _feederDone = true;
+                }
+            }
+        }
+        catch (OperationCanceledException)
+        {
+            // seek / 换文本时的正常路径
+        }
+        catch (Exception ex)
+        {
+            if (!IsStale(generation, session))
+            {
+                Fail(generation, ex);
+            }
+        }
     }
 
     private void UpdateCharIndexLocked()
     {
-        if (_runtime.Count == 0 || _text.Length == 0)
+        if (_plan.Count == 0 || _text.Length == 0)
         {
             return;
         }
@@ -532,8 +623,9 @@ public sealed class ReaderService : IDisposable
         var posBytes = (long)(_player.PositionSeconds * StreamingAudioPlayer.BytesPerSecond);
 
         SegmentRuntime? current = null;
-        foreach (var item in _runtime)
+        for (var i = _sessionStart; i < _plan.Count; i++)
         {
+            var item = _plan[i];
             if (item.PcmBytes <= 0)
             {
                 break;
@@ -548,7 +640,7 @@ public sealed class ReaderService : IDisposable
 
         if (current is null)
         {
-            var last = _runtime.LastOrDefault(item => item.PcmBytes > 0);
+            var last = _plan.LastOrDefault(item => item.PcmBytes > 0);
             _charIndex = last?.Segment.End ?? _charIndex;
             return;
         }
@@ -580,16 +672,16 @@ public sealed class ReaderService : IDisposable
 
     private double EstimateDurationLocked()
     {
-        var synthesized = 0d;
-        var synthesizedChars = 0;
+        var cachedSeconds = 0d;
+        var cachedChars = 0;
         var pendingChars = 0;
 
-        foreach (var item in _runtime)
+        foreach (var item in _plan)
         {
-            if (item.PcmBytes > 0)
+            if (item.Mp3 is not null)
             {
-                synthesized += item.PcmBytes / (double)StreamingAudioPlayer.BytesPerSecond;
-                synthesizedChars += item.Segment.Length;
+                cachedSeconds += item.DurationSeconds;
+                cachedChars += item.Segment.Length;
             }
             else
             {
@@ -597,12 +689,12 @@ public sealed class ReaderService : IDisposable
             }
         }
 
-        if (synthesizedChars == 0)
+        if (cachedChars == 0)
         {
             return 0;
         }
 
-        return synthesized + pendingChars * (synthesized / synthesizedChars);
+        return cachedSeconds + pendingChars * (cachedSeconds / cachedChars);
     }
 
     private void CheckCompletion()
@@ -646,7 +738,14 @@ public sealed class ReaderService : IDisposable
             _status = ReadStatus.Failed;
             _error = ex.Message;
             _feederDone = true;
-            _synthesisDone = true;
+            _session++;
+            _sessionCts?.Cancel();
+
+            // 让还卡在"等这一句合成"的播放循环立刻退出，不要一直挂着
+            foreach (var item in _plan)
+            {
+                item.Ready.TrySetCanceled();
+            }
         }
 
         _player.Stop();
@@ -654,12 +753,64 @@ public sealed class ReaderService : IDisposable
         RaiseStatus();
     }
 
-    private bool IsStale(int generation)
+    private int FindSegmentLocked(int charIndex)
+    {
+        for (var i = 0; i < _plan.Count; i++)
+        {
+            if (_plan[i].Segment.End > charIndex)
+            {
+                return i;
+            }
+        }
+
+        return _plan.Count - 1;
+    }
+
+    private bool IsStale(int generation, int session)
     {
         lock (_gate)
         {
-            return generation != _generation;
+            return generation != _generation || session != _session;
         }
+    }
+
+    /// <summary>
+    /// 把服务端返回的词时间戳对齐到原文字符位置。
+    /// 服务端会对数字/单位做规范化，对不上就退回游标。
+    /// </summary>
+    private static List<WordSpan> BuildWordSpans(string text, List<SpeechBoundary> boundaries)
+    {
+        var spans = new List<WordSpan>(boundaries.Count);
+        var cursor = 0;
+
+        foreach (var boundary in boundaries)
+        {
+            var word = boundary.Text ?? "";
+            var start = cursor;
+
+            if (word.Length > 0)
+            {
+                var found = cursor < text.Length
+                    ? text.IndexOf(word, cursor, StringComparison.Ordinal)
+                    : -1;
+
+                if (found < 0)
+                {
+                    found = text.IndexOf(word, StringComparison.Ordinal);
+                }
+
+                if (found >= 0)
+                {
+                    start = found;
+                }
+            }
+
+            var end = Math.Min(text.Length, start + word.Length);
+            spans.Add(new WordSpan(end, boundary.OffsetSeconds));
+            cursor = Math.Max(cursor, end);
+        }
+
+        return spans;
     }
 
     private void RaiseStatus()
@@ -680,6 +831,7 @@ public sealed class ReaderService : IDisposable
         {
             _generation++;
             _cts?.Cancel();
+            _sessionCts?.Cancel();
         }
 
         _player.Dispose();

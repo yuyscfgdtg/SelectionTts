@@ -10,8 +10,8 @@ namespace SelectionTts.Tts;
 /// Azure 语音服务（备用引擎）。和 Edge 用同一个输出格式，
 /// 所以解码、播放、进度、高亮全部复用，只是换了个"取音频"的地方。
 ///
-/// 与 Edge 的差别：REST 接口不返回词时间戳，进度只能按字数比例估算。
-/// 因为每块只有 250 字，这点差别在进度条上几乎看不出来。
+/// 与 Edge 的差别：REST 接口不返回词时间戳，所以高亮只能按字数比例推进；
+/// 又因为它是"一句话一个请求"，免费层每分钟请求数有限，撞到 429 要等一下再试。
 /// </summary>
 public sealed class AzureTtsClient : ISpeechSynthesizer
 {
@@ -21,6 +21,9 @@ public sealed class AzureTtsClient : ISpeechSynthesizer
     {
         Timeout = TimeSpan.FromSeconds(40),
     };
+
+    /// <summary>被限流后要等到的时刻（UTC ticks），所有请求共享，避免连续撞墙。</summary>
+    private static long _throttleUntilTicks;
 
     private readonly string _region;
     private readonly string _key;
@@ -50,32 +53,54 @@ public sealed class AzureTtsClient : ISpeechSynthesizer
 
         var watch = Stopwatch.StartNew();
         var url = $"https://{_region}.tts.speech.microsoft.com/cognitiveservices/v1";
-
-        using var request = new HttpRequestMessage(HttpMethod.Post, url);
-        request.Headers.TryAddWithoutValidation("Ocp-Apim-Subscription-Key", _key);
-        request.Headers.TryAddWithoutValidation("X-Microsoft-OutputFormat", OutputFormat);
-        request.Headers.TryAddWithoutValidation("User-Agent", "SelectionTts");
-        request.Content = new StringContent(BuildSsml(text, voice, rate), Encoding.UTF8);
-        request.Content.Headers.ContentType =
-            new System.Net.Http.Headers.MediaTypeHeaderValue("application/ssml+xml");
-
-        using var response = await Http.SendAsync(
-            request, HttpCompletionOption.ResponseHeadersRead, cancellationToken);
-
-        if (!response.IsSuccessStatusCode)
-        {
-            throw new HttpRequestException(DescribeFailure(response.StatusCode), null, response.StatusCode);
-        }
-
-        await using var stream = await response.Content.ReadAsStreamAsync(cancellationToken);
-        var buffer = new byte[32 * 1024];
         var total = 0;
 
-        int read;
-        while ((read = await stream.ReadAsync(buffer, cancellationToken)) > 0)
+        for (var attempt = 1; ; attempt++)
         {
-            total += read;
-            onAudio(new ReadOnlyMemory<byte>(buffer, 0, read));
+            await WaitForThrottleAsync(cancellationToken);
+
+            using var request = new HttpRequestMessage(HttpMethod.Post, url);
+            request.Headers.TryAddWithoutValidation("Ocp-Apim-Subscription-Key", _key);
+            request.Headers.TryAddWithoutValidation("X-Microsoft-OutputFormat", OutputFormat);
+            request.Headers.TryAddWithoutValidation("User-Agent", "SelectionTts");
+            request.Content = new StringContent(BuildSsml(text, voice, rate), Encoding.UTF8);
+            request.Content.Headers.ContentType =
+                new System.Net.Http.Headers.MediaTypeHeaderValue("application/ssml+xml");
+
+            using var response = await Http.SendAsync(
+                request, HttpCompletionOption.ResponseHeadersRead, cancellationToken);
+
+            if (response.StatusCode == HttpStatusCode.TooManyRequests)
+            {
+                var wait = response.Headers.RetryAfter?.Delta ?? TimeSpan.FromSeconds(3.5);
+                SetThrottle(wait);
+
+                if (attempt >= 5)
+                {
+                    throw new HttpRequestException(
+                        "Azure 请求过于频繁（429），重试多次仍被拒绝", null, HttpStatusCode.TooManyRequests);
+                }
+
+                Log.Warn($"Azure 限流（429），等 {wait.TotalSeconds:F1}s 后重试（第 {attempt} 次）");
+                continue;
+            }
+
+            if (!response.IsSuccessStatusCode)
+            {
+                throw new HttpRequestException(DescribeFailure(response.StatusCode), null, response.StatusCode);
+            }
+
+            await using var stream = await response.Content.ReadAsStreamAsync(cancellationToken);
+            var buffer = new byte[32 * 1024];
+
+            int read;
+            while ((read = await stream.ReadAsync(buffer, cancellationToken)) > 0)
+            {
+                total += read;
+                onAudio(new ReadOnlyMemory<byte>(buffer, 0, read));
+            }
+
+            break;
         }
 
         if (total == 0)
@@ -85,6 +110,37 @@ public sealed class AzureTtsClient : ISpeechSynthesizer
 
         _ = onBoundary; // REST 接口没有时间戳
         return new SynthesisSummary(total, 0, (int)watch.ElapsedMilliseconds, 1);
+    }
+
+    private static void SetThrottle(TimeSpan wait)
+    {
+        var until = DateTime.UtcNow.Add(wait).Ticks;
+        long current;
+
+        do
+        {
+            current = Interlocked.Read(ref _throttleUntilTicks);
+            if (current >= until)
+            {
+                return;
+            }
+        }
+        while (Interlocked.CompareExchange(ref _throttleUntilTicks, until, current) != current);
+    }
+
+    private static async Task WaitForThrottleAsync(CancellationToken cancellationToken)
+    {
+        while (true)
+        {
+            var until = Interlocked.Read(ref _throttleUntilTicks);
+            var remaining = until - DateTime.UtcNow.Ticks;
+            if (remaining <= 0)
+            {
+                return;
+            }
+
+            await Task.Delay(TimeSpan.FromTicks(remaining), cancellationToken);
+        }
     }
 
     private static string DescribeFailure(HttpStatusCode status) => status switch

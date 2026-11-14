@@ -234,14 +234,17 @@ public partial class ReaderBoardWindow : Window
         MetaText.Text = state.Status switch
         {
             ReadStatus.Preparing => $"已合成 {state.SynthChars}/{state.SynthTotal} 字",
-            ReadStatus.Completed => $"共 {state.CharCount} 字",
+            ReadStatus.Completed => state.SynthesisDone
+                ? $"共 {state.CharCount} 字"
+                : $"补合成 {(int)Math.Round(state.SynthesisProgress * 100)}%",
             ReadStatus.Failed => state.Error ?? "",
             _ => $"剩余 {FormatSeconds(state.RemainingSeconds)}",
         };
 
-        // 进度条只表示"引擎合成到哪了"；合成结束就收起，朗读进度交给高亮行。
-        var showBar = !state.SynthesisDone &&
-                      state.Status is ReadStatus.Preparing or ReadStatus.Playing;
+        // 进度条只表示"引擎合成到哪了"；全部缓存好才收起。
+        var showBar = state.CharCount > 0 &&
+                      !state.SynthesisDone &&
+                      state.Status != ReadStatus.Failed;
         ProgressFill.Width = showBar
             ? Math.Max(0, ProgressTrack.ActualWidth * state.SynthesisProgress)
             : 0;
@@ -315,10 +318,13 @@ public partial class ReaderBoardWindow : Window
 
     private double AvailableWidth()
     {
+        // 预留滚动条宽度：文本不该跑到滑块下面去
+        const double ScrollGutter = 10;
+
         var viewport = Scroller.ViewportWidth;
         if (viewport > 32)
         {
-            return viewport - 6;
+            return Math.Max(80, viewport - ScrollGutter - 4);
         }
 
         return Math.Max(80, Scroller.ActualWidth - 28);

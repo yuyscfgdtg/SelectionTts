@@ -2,7 +2,7 @@ namespace SelectionTts.Core;
 
 /// <summary>
 /// 一段待合成的文本。Start/Length 是它在整篇文本里的位置，
-/// 朗读板靠这两个值把"读到第几个字"映射回高亮块。
+/// 朗读板靠这两个值把"读到第几个字"映射回高亮行。
 /// </summary>
 public readonly record struct TextSegment(int Index, int Start, int Length, string Text)
 {
@@ -10,19 +10,16 @@ public readonly record struct TextSegment(int Index, int Start, int Length, stri
 }
 
 /// <summary>
-/// 把整篇文本切成合成块。
+/// 按"句"切分合成单位。
 ///
-/// 规则：
-/// - 优先在句末（。！？；换行）断开，绝不把一句话切成两半；
-/// - 第一块用更小的上限（默认 50 字）：首块大小直接决定"多久出声"；
-/// - 其余块按 250 字打包；
-/// - 单句超过上限才降级到逗号/顿号，再不行才硬切；
-/// - 块是原文本的连续切片，拼起来等于原文，位置不会错位。
+/// 为什么是句子而不是 250 字：只有让每个合成段都从句子开头开始，
+/// 点某一行时才能"从这一句开头播"，而不需要音频时间戳（Azure 没有）。
+/// 段 = 音频缓存的最小单位，seek 命中即可秒开。
 /// </summary>
 public static class TextSegmenter
 {
-    public const int TargetChars = 250;
-    public const int FirstTargetChars = 50;
+    /// <summary>单句超过这个长度就按逗号等降级再切，避免一次请求过大。</summary>
+    public const int SentenceMaxChars = 150;
 
     private static readonly char[] HardBreakChars =
         ['。', '！', '？', '；', '!', '?', ';', '\n'];
@@ -33,8 +30,8 @@ public static class TextSegmenter
     private static readonly char[] TrailingChars =
         ['"', '”', '’', ')', '）', '」', '』', '】', '》'];
 
-    public static List<TextSegment> Split(
-        string text, int target = TargetChars, int firstTarget = FirstTargetChars)
+    /// <summary>一句一段。整篇文本切完后，拼起来等于原文，位置不会错位。</summary>
+    public static List<TextSegment> SplitSentences(string text)
     {
         var result = new List<TextSegment>();
         if (string.IsNullOrEmpty(text))
@@ -42,40 +39,11 @@ public static class TextSegmenter
             return result;
         }
 
-        if (target < 50)
-        {
-            target = 50;
-        }
-
-        if (firstTarget <= 0 || firstTarget > target)
-        {
-            firstTarget = target;
-        }
-
-        var pendingStart = -1;
-        var pendingEnd = -1;
-        var limit = firstTarget;
-
-        void Flush()
-        {
-            if (pendingStart < 0)
-            {
-                return;
-            }
-
-            AddSlice(result, text, pendingStart, pendingEnd);
-            pendingStart = -1;
-            pendingEnd = -1;
-            // 首块落地后，后续都按正常长度打包
-            limit = target;
-        }
-
         foreach (var (start, end) in FindSentenceBounds(text))
         {
-            if (end - start > target)
+            if (end - start > SentenceMaxChars)
             {
-                Flush();
-                foreach (var (pieceStart, pieceEnd) in SplitOversized(text, start, end, target))
+                foreach (var (pieceStart, pieceEnd) in SplitOversized(text, start, end, SentenceMaxChars))
                 {
                     AddSlice(result, text, pieceStart, pieceEnd);
                 }
@@ -83,25 +51,49 @@ public static class TextSegmenter
                 continue;
             }
 
-            if (pendingStart < 0)
-            {
-                pendingStart = start;
-                pendingEnd = end;
-            }
-            else if (end - pendingStart <= limit)
-            {
-                pendingEnd = end;
-            }
-            else
-            {
-                Flush();
-                pendingStart = start;
-                pendingEnd = end;
-            }
+            AddSlice(result, text, start, end);
         }
 
-        Flush();
         return result;
+    }
+
+    /// <summary>
+    /// 找到 charIndex 所在句子的第一个字。
+    /// 点行时用它：行可能只是半句，但播放必须从一句的开头开始。
+    /// </summary>
+    public static int SentenceStart(string text, int charIndex)
+    {
+        if (string.IsNullOrEmpty(text))
+        {
+            return 0;
+        }
+
+        var index = Math.Clamp(charIndex, 0, text.Length - 1);
+
+        for (var i = index - 1; i >= 0; i--)
+        {
+            if (Array.IndexOf(HardBreakChars, text[i]) < 0)
+            {
+                continue;
+            }
+
+            var start = i + 1;
+            while (start < text.Length &&
+                   (char.IsWhiteSpace(text[start]) || Array.IndexOf(TrailingChars, text[start]) >= 0))
+            {
+                start++;
+            }
+
+            return start;
+        }
+
+        var head = 0;
+        while (head < text.Length && char.IsWhiteSpace(text[head]))
+        {
+            head++;
+        }
+
+        return head;
     }
 
     private static void AddSlice(List<TextSegment> result, string text, int start, int end)
