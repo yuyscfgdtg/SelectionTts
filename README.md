@@ -2,7 +2,7 @@
 
 Windows 10/11 的划词朗读原型。Phase 0 先用 Python + PySide6 验证取词、Edge TTS 音质/延迟和托盘交互，确认后再用 C# 重写正式版。
 
-当前进度：**D1–D4 完成**。取词优先走 UI Automation，失败再回退 Ctrl+C；全局快捷键和划词弹窗都已接入。下一步是 D5 通用场景测试矩阵。
+当前进度：**D1–D5 完成**。取词优先走 UI Automation，失败再回退 Ctrl+C；全局快捷键、划词弹窗、通用场景矩阵都已验证。下一步是 D6 全屏/游戏自动暂停。
 
 ## 环境要求
 
@@ -67,7 +67,10 @@ Phase 0 暂未接入：
 
 - 管理员权限运行的程序：普通权限进程无法向它发送 `Ctrl+C`；UIA 通常也读不到，视为不支持。
 - 终端窗口：剪贴板兜底会被跳过；如果终端提供 UIA `TextPattern`（如 Windows Terminal），仍可通过 UIA 读取。
-- 浏览器：Chrome/Edge 默认不向 UIA 暴露正文选区，会走剪贴板兜底。
+- 浏览器：Chrome/Edge 在收到无障碍查询后通常能通过 UIA 取词，失败时回退剪贴板。
+- 资源管理器等文件管理器：选中的是文件而不是文本，会主动跳过（不发送 `Ctrl+C`，也不改动剪贴板）。
+- PDF 阅读器：UIA 能取到文本，但 PDF 文本层可能丢失空格或连字符。
+- Excel：走剪贴板兜底，且采用延迟渲染，取词可能比其它应用慢（约 0.1–1.5s）。
 - Qt/Tk、游戏和部分 Electron 应用不提供 `TextPattern`，同样走剪贴板兜底。
 - DRM 视频、游戏、部分 Java/Electron 应用可能无法复制选区。
 - 划选检测依赖全局鼠标钩子：某些全局鼠标工具、远程桌面或反作弊程序可能拦截钩子。
@@ -92,12 +95,14 @@ uv run python scripts\probe_popup.py       # D3：拖选→弹窗→点击朗读
 uv run python scripts\probe_popup_hide.py  # D3：弹窗超时自动隐藏（无需托盘程序）
 uv run python scripts\probe_uia.py         # D4：UIA 直接取词（WPF 目标，不碰剪贴板）
 uv run python scripts\probe_hotkey_uia.py  # D4：热键→UIA→朗读端到端
+uv run python scripts\probe_matrix.py      # D5：通用场景矩阵（记事本/浏览器/终端/Office/PDF）
 ```
+
+`probe_matrix.py` 只取词不播放，可只跑单个场景，例如 `uv run python scripts\probe_matrix.py excel`。
 
 ## 下一步
 
-- D5：通用场景测试矩阵
 - D6：全屏/游戏自动暂停、进程排除
 - D7：指标汇总与 go/no-go
 
-详细记录见 `docs/d2-report.md`、`docs/d3-report.md`、`docs/d4-report.md`。
+详细记录见 `docs/d2-report.md`、`docs/d3-report.md`、`docs/d4-report.md`、`docs/d5-report.md`。

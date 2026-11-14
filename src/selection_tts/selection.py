@@ -23,6 +23,16 @@ _CONSOLE_CLASSES = {
     "CASCADIA_HOSTING_WINDOW_CLASS",
 }
 
+# File managers copy CF_HDROP (a list of file paths), never text. Sending
+# Ctrl+C there would replace the user's clipboard with files and still yield no
+# readable text, so the clipboard fallback is skipped entirely.
+_FILE_SELECTION_CLASSES = {
+    "CabinetWClass",
+    "ExploreWClass",
+    "Progman",
+    "WorkerW",
+}
+
 
 @dataclass
 class SelectionResult:
@@ -117,6 +127,17 @@ def read_selection_via_clipboard(
             method="clipboard",
             elapsed_ms=int((time.perf_counter() - started) * 1000),
         )
+    if foreground_class in _FILE_SELECTION_CLASSES:
+        log.info(
+            "前台是文件管理器（class=%s, title=%r），选中的是文件而不是文本，跳过 Ctrl+C 兜底",
+            foreground_class,
+            foreground_title,
+        )
+        return SelectionResult(
+            text="",
+            method="clipboard",
+            elapsed_ms=int((time.perf_counter() - started) * 1000),
+        )
 
     before = get_sequence_number()
     snapshot = snapshot_clipboard() if restore else None
@@ -138,9 +159,14 @@ def read_selection_via_clipboard(
         log.info("Ctrl+C 未改变剪贴板，可能没有选中文本或目标窗口拒绝复制")
         return SelectionResult(text="", method="clipboard", elapsed_ms=elapsed_ms)
 
-    # Give the owner a moment to finish writing all clipboard formats.
-    time.sleep(0.03)
+    # Give the owner a moment to finish writing all clipboard formats. Excel and
+    # some other apps render clipboard data lazily, so the first read is often
+    # empty while the sequence number has already changed.
     text = read_clipboard_text()
+    read_deadline = time.perf_counter() + 0.6
+    while not text and time.perf_counter() < read_deadline:
+        time.sleep(0.05)
+        text = read_clipboard_text()
     restored: bool | None = None
     if snapshot is not None:
         if get_sequence_number() == copied_sequence:
