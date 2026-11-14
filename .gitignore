@@ -17,3 +17,9 @@ config.local.json
 .mypy_cache/
 .ruff_cache/
 .pytest_cache/
+
+# .NET build output
+app/**/bin/
+app/**/obj/
+app/**/data/
+publish/
