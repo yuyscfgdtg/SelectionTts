@@ -104,7 +104,7 @@ public sealed class ClipboardWatcher : IDisposable
                 _lastAt = now;
             }
 
-            Log.Info($"检测到复制：{text.Length} 字 | 预览={Preview(text)}");
+            Log.Info($"检测到复制：{text.Length} 字");
             TextCopied?.Invoke(text);
         }
         finally
@@ -113,6 +113,11 @@ public sealed class ClipboardWatcher : IDisposable
         }
     }
 
+    /// <summary>
+    /// 读不到文本时再试两次：有些程序（Excel、远程桌面）用延迟渲染，
+    /// 剪贴板事件到达时还没准备好。只在"读空"时重试，读到就不再看第二眼——
+    /// 同一次复制只会提交一次结果，不会重复朗读。
+    /// </summary>
     private static string? ReadWithRetry()
     {
         for (var attempt = 1; attempt <= 3; attempt++)
@@ -124,7 +129,18 @@ public sealed class ClipboardWatcher : IDisposable
 
             if (!result.Retry)
             {
-                return result.Text;
+                if (!string.IsNullOrWhiteSpace(result.Text))
+                {
+                    return result.Text;
+                }
+
+                if (attempt == 3)
+                {
+                    return null;
+                }
+
+                Thread.Sleep(attempt == 1 ? 120 : 180);
+                continue;
             }
 
             if (attempt < 3)
@@ -144,12 +160,6 @@ public sealed class ClipboardWatcher : IDisposable
         }
 
         return result.Text;
-    }
-
-    private static string Preview(string text)
-    {
-        var single = text.Replace("\r", " ").Replace("\n", " ").Replace("\t", " ").Trim();
-        return single.Length <= 40 ? single : single[..40] + "…";
     }
 
     public void Dispose()

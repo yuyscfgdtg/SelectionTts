@@ -1,39 +1,61 @@
 using System.Diagnostics;
 using System.Drawing;
+using System.Drawing.Imaging;
 using System.Windows.Forms;
 using SelectionTts.Core;
 
 namespace SelectionTts.Tray;
 
+/// <summary>
+/// 托盘：总开关、朗读板开关、停止朗读、音色、语速、退出。
+///
+/// 总开关是"软件级"的（类似 VPN 的连接开关）：关闭时图标变灰、状态显示"已关闭"。
+/// </summary>
 public sealed class TrayIconManager : IDisposable
 {
     private readonly AppSettings _settings;
     private readonly NotifyIcon _icon;
-    private readonly ToolStripMenuItem _watchItem;
+    private readonly ToolStripMenuItem _enabledItem;
+    private readonly ToolStripMenuItem _boardItem;
     private readonly Dictionary<string, ToolStripMenuItem> _voiceItems = [];
     private readonly Dictionary<string, ToolStripMenuItem> _rateItems = [];
+    private readonly Icon _normalIcon;
+    private readonly Icon _disabledIcon;
+
+    private bool _enabled;
+    private string _status = "待命";
 
     public event Action? ExitRequested;
     public event Action? StopRequested;
     public event Action? ToggleWatchRequested;
+    public event Action? ToggleBoardRequested;
 
     public TrayIconManager(AppSettings settings)
     {
         _settings = settings;
+        _normalIcon = LoadIcon();
+        _disabledIcon = Grayscale(_normalIcon);
 
-        _watchItem = new ToolStripMenuItem("监听剪贴板    Ctrl+Alt+R")
+        _enabledItem = new ToolStripMenuItem
         {
-            Checked = settings.WatchEnabled,
             CheckOnClick = false,
         };
-        _watchItem.Click += (_, _) =>
+        _enabledItem.Click += (_, _) =>
         {
-            Log.Info("托盘菜单：切换监听");
+            Log.Info("托盘菜单：切换总开关");
             ToggleWatchRequested?.Invoke();
         };
 
+        _boardItem = new ToolStripMenuItem
+        {
+            CheckOnClick = false,
+            Checked = settings.BoardVisible,
+        };
+        _boardItem.Click += (_, _) => ToggleBoardRequested?.Invoke();
+
         var menu = new ContextMenuStrip { ShowImageMargin = false };
-        menu.Items.Add(_watchItem);
+        menu.Items.Add(_enabledItem);
+        menu.Items.Add(_boardItem);
         menu.Items.Add(new ToolStripMenuItem("停止朗读", null, (_, _) => StopRequested?.Invoke()));
         menu.Items.Add(new ToolStripSeparator());
         menu.Items.Add(BuildVoiceMenu());
@@ -46,26 +68,47 @@ public sealed class TrayIconManager : IDisposable
 
         _icon = new NotifyIcon
         {
-            Icon = LoadIcon(),
-            Text = "剪贴板朗读 · 未监听",
+            Icon = _disabledIcon,
+            Text = "剪贴板朗读 · 已关闭",
             ContextMenuStrip = menu,
             Visible = true,
         };
-    }
 
-    public void SetWatching(bool watching)
-    {
-        _watchItem.Checked = watching;
-        SetStatus(watching ? "监听中" : "未监听");
+        UpdateEnabledText();
     }
 
     public void Notify(string message) =>
         _icon.ShowBalloonTip(2000, "剪贴板朗读", message, ToolTipIcon.None);
 
-    /// <summary>托盘悬停提示，最多 63 个字符（Win32 限制）。</summary>
+    public void SetEnabled(bool enabled)
+    {
+        _enabled = enabled;
+        _icon.Icon = enabled ? _normalIcon : _disabledIcon;
+        _boardItem.Enabled = true;
+        UpdateEnabledText();
+        UpdateTip();
+    }
+
+    /// <summary>朗读状态（合成中/朗读中/已停止…）。</summary>
     public void SetStatus(string status)
     {
-        var text = "剪贴板朗读 · " + status;
+        _status = status;
+        UpdateTip();
+    }
+
+    public void SetBoardVisible(bool visible) => _boardItem.Checked = visible;
+
+    private void UpdateEnabledText()
+    {
+        _enabledItem.Text = _enabled
+            ? "● 朗读已启用（点击关闭）"
+            : "○ 朗读已关闭（点击启用）";
+    }
+
+    /// <summary>托盘悬停提示，最多 63 个字符（Win32 限制）。</summary>
+    private void UpdateTip()
+    {
+        var text = _enabled ? $"剪贴板朗读 · {_status}" : "剪贴板朗读 · 已关闭";
         _icon.Text = text.Length <= 63 ? text : text[..63];
     }
 
@@ -185,6 +228,44 @@ public sealed class TrayIconManager : IDisposable
         }
 
         return SystemIcons.Application;
+    }
+
+    /// <summary>关闭态图标：灰度 + 半透明，一眼能看出"没在工作"。</summary>
+    private static Icon Grayscale(Icon source)
+    {
+        try
+        {
+            using var bitmap = source.ToBitmap();
+            using var gray = new Bitmap(bitmap.Width, bitmap.Height);
+            using (var graphics = Graphics.FromImage(gray))
+            using (var attributes = new ImageAttributes())
+            {
+                attributes.SetColorMatrix(new ColorMatrix(
+                [
+                    [0.30f, 0.30f, 0.30f, 0f, 0f],
+                    [0.59f, 0.59f, 0.59f, 0f, 0f],
+                    [0.11f, 0.11f, 0.11f, 0f, 0f],
+                    [0f, 0f, 0f, 0.45f, 0f],
+                    [0f, 0f, 0f, 0f, 1f],
+                ]));
+
+                graphics.DrawImage(
+                    bitmap,
+                    new Rectangle(0, 0, bitmap.Width, bitmap.Height),
+                    0,
+                    0,
+                    bitmap.Width,
+                    bitmap.Height,
+                    GraphicsUnit.Pixel,
+                    attributes);
+            }
+
+            return Icon.FromHandle(gray.GetHicon());
+        }
+        catch
+        {
+            return source;
+        }
     }
 
     public void Dispose()

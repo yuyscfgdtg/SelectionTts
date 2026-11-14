@@ -12,6 +12,14 @@ public sealed class AppSettings
 
     /// <summary>监听剪贴板：复制文本后自动朗读。默认关闭。</summary>
     public bool WatchEnabled { get; set; }
+
+    /// <summary>朗读板位置（-1 表示使用默认的右下角）。</summary>
+    public int BoardX { get; set; } = -1;
+
+    public int BoardY { get; set; } = -1;
+
+    /// <summary>朗读板是否显示（用户点 × 隐藏后不再自动弹出）。</summary>
+    public bool BoardVisible { get; set; } = true;
 }
 
 public static class SettingsStore
