@@ -5,20 +5,16 @@ using SelectionTts.Core;
 namespace SelectionTts.Platform;
 
 /// <summary>
-/// 用 Win32 RegisterHotKey 注册全局热键（不使用键盘钩子）。
-/// 消息通过一个 message-only 窗口接收。
+/// 用一个 message-only 窗口接收热键，Ctrl+Alt+R 切换"监听剪贴板"。
 /// </summary>
 public sealed class HotkeyManager : IDisposable
 {
-    private const int ReadId = 1;
-    private const int TogglePopupId = 2;
+    private const int ToggleWatchId = 1;
     private const uint VkR = 0x52;
-    private const uint VkP = 0x50;
 
     private readonly HotkeyWindow _window = new();
 
-    public event Action? ReadRequested;
-    public event Action? TogglePopupRequested;
+    public event Action? ToggleWatchRequested;
 
     public HotkeyManager()
     {
@@ -28,51 +24,36 @@ public sealed class HotkeyManager : IDisposable
 
     public bool RegisterDefaults()
     {
-        var okRead = NativeMethods.RegisterHotKey(
+        var ok = NativeMethods.RegisterHotKey(
             _window.Handle,
-            ReadId,
+            ToggleWatchId,
             NativeMethods.MOD_CONTROL | NativeMethods.MOD_ALT | NativeMethods.MOD_NOREPEAT,
             VkR);
 
-        var okToggle = NativeMethods.RegisterHotKey(
-            _window.Handle,
-            TogglePopupId,
-            NativeMethods.MOD_CONTROL | NativeMethods.MOD_ALT | NativeMethods.MOD_SHIFT | NativeMethods.MOD_NOREPEAT,
-            VkP);
-
-        if (!okRead)
+        if (!ok)
         {
             Log.Warn($"注册 Ctrl+Alt+R 失败，错误码 {Marshal.GetLastWin32Error()}");
         }
 
-        if (!okToggle)
-        {
-            Log.Warn($"注册 Ctrl+Alt+Shift+P 失败，错误码 {Marshal.GetLastWin32Error()}");
-        }
-
-        return okRead && okToggle;
+        return ok;
     }
 
     private void OnHotkeyPressed(int id)
     {
-        Log.Info($"热键触发 id={id}");
-        switch (id)
+        if (id != ToggleWatchId)
         {
-            case ReadId:
-                ReadRequested?.Invoke();
-                break;
-            case TogglePopupId:
-                TogglePopupRequested?.Invoke();
-                break;
+            return;
         }
+
+        Log.Info("热键触发：切换监听");
+        ToggleWatchRequested?.Invoke();
     }
 
     public void Dispose()
     {
         if (_window.Handle != IntPtr.Zero)
         {
-            NativeMethods.UnregisterHotKey(_window.Handle, ReadId);
-            NativeMethods.UnregisterHotKey(_window.Handle, TogglePopupId);
+            NativeMethods.UnregisterHotKey(_window.Handle, ToggleWatchId);
         }
 
         _window.DestroyHandle();

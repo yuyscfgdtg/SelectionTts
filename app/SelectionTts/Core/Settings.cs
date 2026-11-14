@@ -6,16 +6,12 @@ public sealed class AppSettings
 {
     public string Voice { get; set; } = VoiceCatalog.Default;
     public string Rate { get; set; } = "+0%";
-    public bool AutoPopup { get; set; } = true;
-    public bool PauseInFullscreen { get; set; } = true;
-    public List<string> ExcludedProcesses { get; set; } = [];
-    public bool UseUia { get; set; } = true;
-    public bool ClipboardRestore { get; set; } = true;
-    public int PopupDelayMs { get; set; } = 120;
-    public int PopupTimeoutMs { get; set; } = 4000;
     public int MaxChars { get; set; } = 5000;
     public string Engine { get; set; } = "edge";
     public string EdgeProxy { get; set; } = "";
+
+    /// <summary>监听剪贴板：复制文本后自动朗读。默认关闭。</summary>
+    public bool WatchEnabled { get; set; }
 }
 
 public static class SettingsStore
@@ -86,18 +82,6 @@ public static class SettingsStore
             settings.Rate = "+0%";
         }
 
-        settings.ExcludedProcesses = settings.ExcludedProcesses
-            .Where(item => !string.IsNullOrWhiteSpace(item))
-            .Select(item =>
-            {
-                var name = item.Trim();
-                return name.EndsWith(".exe", StringComparison.OrdinalIgnoreCase) ? name : name + ".exe";
-            })
-            .Distinct(StringComparer.OrdinalIgnoreCase)
-            .ToList();
-
-        settings.PopupDelayMs = Math.Clamp(settings.PopupDelayMs, 0, 2000);
-        settings.PopupTimeoutMs = Math.Clamp(settings.PopupTimeoutMs, 500, 30000);
         settings.MaxChars = Math.Clamp(settings.MaxChars, 50, 20000);
     }
 }

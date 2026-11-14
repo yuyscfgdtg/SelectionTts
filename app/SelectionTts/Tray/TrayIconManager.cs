@@ -9,40 +9,31 @@ public sealed class TrayIconManager : IDisposable
 {
     private readonly AppSettings _settings;
     private readonly NotifyIcon _icon;
-    private readonly ToolStripMenuItem _autoPopupItem;
-    private readonly ToolStripMenuItem _fullscreenItem;
+    private readonly ToolStripMenuItem _watchItem;
     private readonly Dictionary<string, ToolStripMenuItem> _voiceItems = [];
     private readonly Dictionary<string, ToolStripMenuItem> _rateItems = [];
 
     public event Action? ExitRequested;
-    public event Action? ReadRequested;
     public event Action? StopRequested;
+    public event Action? ToggleWatchRequested;
 
     public TrayIconManager(AppSettings settings)
     {
         _settings = settings;
 
-        _autoPopupItem = new ToolStripMenuItem("自动弹窗    Ctrl+Alt+Shift+P")
+        _watchItem = new ToolStripMenuItem("监听剪贴板    Ctrl+Alt+R")
         {
-            Checked = settings.AutoPopup,
+            Checked = settings.WatchEnabled,
             CheckOnClick = false,
         };
-        _autoPopupItem.Click += (_, _) =>
+        _watchItem.Click += (_, _) =>
         {
-            Log.Info("托盘菜单：点击自动弹窗");
-            ToggleAutoPopup();
+            Log.Info("托盘菜单：切换监听");
+            ToggleWatchRequested?.Invoke();
         };
-
-        _fullscreenItem = new ToolStripMenuItem("全屏/游戏时暂停自动弹窗")
-        {
-            Checked = settings.PauseInFullscreen,
-        };
-        _fullscreenItem.Click += (_, _) => ToggleFullscreenPause();
 
         var menu = new ContextMenuStrip { ShowImageMargin = false };
-        menu.Items.Add(new ToolStripMenuItem("朗读当前选区    Ctrl+Alt+R", null, (_, _) => ReadRequested?.Invoke()));
-        menu.Items.Add(_autoPopupItem);
-        menu.Items.Add(_fullscreenItem);
+        menu.Items.Add(_watchItem);
         menu.Items.Add(new ToolStripMenuItem("停止朗读", null, (_, _) => StopRequested?.Invoke()));
         menu.Items.Add(new ToolStripSeparator());
         menu.Items.Add(BuildVoiceMenu());
@@ -56,38 +47,26 @@ public sealed class TrayIconManager : IDisposable
         _icon = new NotifyIcon
         {
             Icon = LoadIcon(),
-            Text = "划词朗读",
+            Text = "剪贴板朗读 · 未监听",
             ContextMenuStrip = menu,
             Visible = true,
         };
     }
 
+    public void SetWatching(bool watching)
+    {
+        _watchItem.Checked = watching;
+        SetStatus(watching ? "监听中" : "未监听");
+    }
+
     public void Notify(string message) =>
-        _icon.ShowBalloonTip(2200, "划词朗读", message, ToolTipIcon.None);
+        _icon.ShowBalloonTip(2000, "剪贴板朗读", message, ToolTipIcon.None);
 
     /// <summary>托盘悬停提示，最多 63 个字符（Win32 限制）。</summary>
     public void SetStatus(string status)
     {
-        var text = "划词朗读 · " + status;
+        var text = "剪贴板朗读 · " + status;
         _icon.Text = text.Length <= 63 ? text : text[..63];
-    }
-
-    public void ToggleAutoPopup()
-    {
-        _settings.AutoPopup = !_settings.AutoPopup;
-        _autoPopupItem.Checked = _settings.AutoPopup;
-        SettingsStore.Save(_settings);
-        Log.Info($"自动弹窗：{(_settings.AutoPopup ? "开启" : "关闭")}");
-        Notify(_settings.AutoPopup ? "自动弹窗已开启" : "自动弹窗已关闭（快捷键仍可用）");
-    }
-
-    private void ToggleFullscreenPause()
-    {
-        _settings.PauseInFullscreen = !_settings.PauseInFullscreen;
-        _fullscreenItem.Checked = _settings.PauseInFullscreen;
-        SettingsStore.Save(_settings);
-        Log.Info($"全屏暂停：{(_settings.PauseInFullscreen ? "开启" : "关闭")}");
-        Notify(_settings.PauseInFullscreen ? "全屏/游戏时已暂停自动弹窗" : "全屏/游戏时也会自动弹窗");
     }
 
     private ToolStripMenuItem BuildVoiceMenu()

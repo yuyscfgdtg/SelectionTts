@@ -1,14 +1,12 @@
 using System.Diagnostics;
 using SelectionTts.Audio;
-using SelectionTts.Core;
-using SelectionTts.Platform;
 using SelectionTts.Tts;
 
 namespace SelectionTts.Core;
 
 /// <summary>
-/// 朗读编排：取词 → 合成 → 播放。
-/// 新的请求总是打断旧的（停音频、取消合成），不再用“正在朗读中”拒绝。
+/// 朗读编排：文本 → 合成 → 播放。
+/// 新的请求总是打断旧的（停音频、取消合成），不再用"正在朗读中"拒绝。
 /// </summary>
 public sealed class ReaderService : IDisposable
 {
@@ -18,6 +16,7 @@ public sealed class ReaderService : IDisposable
     private readonly object _gate = new();
     private int _requestId;
     private CancellationTokenSource? _cts;
+    private bool _active;
 
     public event Action<string>? StatusChanged;
     public event Action<string>? Failed;
@@ -27,26 +26,7 @@ public sealed class ReaderService : IDisposable
         _settings = settings;
     }
 
-    public void ReadSelection(int waitReleaseMs = 250) =>
-        Start(preloadedText: null, source: "clipboard", waitReleaseMs);
-
-    /// <summary>朗读浮窗已经取到的文本，不再重复取词。</summary>
-    public void ReadText(string text) =>
-        Start(preloadedText: text, source: "popup", waitReleaseMs: 0);
-
-    public void Stop()
-    {
-        lock (_gate)
-        {
-            _requestId++;
-            _cts?.Cancel();
-            _player.Stop();
-        }
-
-        StatusChanged?.Invoke("已停止");
-    }
-
-    private void Start(string? preloadedText, string source, int waitReleaseMs)
+    public void Speak(string text)
     {
         int generation;
         CancellationToken token;
@@ -57,74 +37,52 @@ public sealed class ReaderService : IDisposable
             _cts = new CancellationTokenSource();
             token = _cts.Token;
             _player.Stop();
-            if (generation > 1)
-            {
-                Log.Info("新的朗读请求，打断上一次朗读");
-            }
+            _active = true;
         }
 
-        Task.Run(() => Worker(generation, preloadedText, source, waitReleaseMs, token), token);
+        Task.Run(() => Worker(generation, text, token), token);
     }
 
-    private async Task Worker(
-        int generation,
-        string? preloadedText,
-        string source,
-        int waitReleaseMs,
-        CancellationToken token)
+    public void Stop()
+    {
+        lock (_gate)
+        {
+            if (!_active)
+            {
+                return;
+            }
+
+            _active = false;
+            _requestId++;
+            _cts?.Cancel();
+            _player.Stop();
+        }
+
+        StatusChanged?.Invoke("已停止");
+    }
+
+    private async Task Worker(int generation, string text, CancellationToken token)
     {
         var watch = Stopwatch.StartNew();
 
         try
         {
-            string raw;
-            string method;
-            var selectionMs = 0;
+            var (normalized, truncated) = TextUtil.Truncate(
+                TextUtil.Normalize(text), _settings.MaxChars);
 
-            if (preloadedText is not null)
+            if (normalized.Length == 0)
             {
-                raw = preloadedText;
-                method = source;
-            }
-            else
-            {
-                StatusChanged?.Invoke("正在读取选中文本…");
-                var selection = SelectionReader.Read(
-                    _settings.UseUia,
-                    _settings.ClipboardRestore,
-                    waitReleaseMs);
-
-                if (IsStale(generation))
-                {
-                    return;
-                }
-
-                if (string.IsNullOrWhiteSpace(selection.Text))
-                {
-                    StatusChanged?.Invoke("没有检测到选中文本");
-                    Log.Info("取词结果为空");
-                    return;
-                }
-
-                raw = selection.Text;
-                method = selection.Method;
-                selectionMs = selection.ElapsedMs;
-            }
-
-            var (text, truncated) = TextUtil.Truncate(TextUtil.Normalize(raw), _settings.MaxChars);
-            if (text.Length == 0)
-            {
-                StatusChanged?.Invoke("没有检测到选中文本");
+                StatusChanged?.Invoke("没有可朗读的文本");
                 return;
             }
 
             if (truncated)
             {
-                StatusChanged?.Invoke($"文本较长，仅朗读前 {_settings.MaxChars} 字");
+                Log.Info($"文本超过 {_settings.MaxChars} 字，截断朗读");
             }
 
-            StatusChanged?.Invoke($"正在合成（{text.Length} 字）…");
-            var audio = await _tts.SynthesizeAsync(text, _settings.Voice, _settings.Rate, token);
+            StatusChanged?.Invoke($"正在合成（{normalized.Length} 字）…");
+            var audio = await _tts.SynthesizeAsync(normalized, _settings.Voice, _settings.Rate, token);
 
             if (IsStale(generation))
             {
@@ -141,16 +99,23 @@ public sealed class ReaderService : IDisposable
 
                 _player.Play(audio.Audio, ok =>
                 {
-                    if (!IsStale(generation))
+                    if (IsStale(generation))
                     {
-                        StatusChanged?.Invoke(ok ? "朗读完成" : "已停止");
+                        return;
                     }
+
+                    lock (_gate)
+                    {
+                        _active = false;
+                    }
+
+                    StatusChanged?.Invoke(ok ? "朗读完成" : "已停止");
                 });
             }
 
             Log.Info(
-                $"朗读 {text.Length} 字 | 方法={method} | 取词={selectionMs}ms | " +
-                $"合成={audio.ElapsedMs}ms | 尝试={audio.Attempts} | 总计={watch.ElapsedMilliseconds}ms");
+                $"朗读 {normalized.Length} 字 | 合成={audio.ElapsedMs}ms | " +
+                $"尝试={audio.Attempts} | 总计={watch.ElapsedMilliseconds}ms");
         }
         catch (OperationCanceledException)
         {
@@ -161,6 +126,11 @@ public sealed class ReaderService : IDisposable
             if (IsStale(generation))
             {
                 return;
+            }
+
+            lock (_gate)
+            {
+                _active = false;
             }
 
             Log.Error("朗读失败", ex);
