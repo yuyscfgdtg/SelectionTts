@@ -10,8 +10,8 @@ from PySide6.QtCore import QObject, Signal
 from pynput import mouse
 
 from .config import AppConfig
-from .foreground import get_foreground_info
-from .fullscreen import is_fullscreen_or_busy
+from .foreground import get_foreground_info, get_process_name
+from .fullscreen import is_fullscreen_now
 from .metrics import log_event
 from .selection import read_selection
 from .text_utils import normalize_text
@@ -56,6 +56,7 @@ class SelectionMonitor(QObject):
         self._ignore_until = 0.0
         self._popup_rect: tuple[int, int, int, int] | None = None
         self._rect_lock = threading.Lock()
+        self._pause_state = ""
 
     def set_popup_rect(self, rect: tuple[int, int, int, int] | None) -> None:
         with self._rect_lock:
@@ -101,6 +102,16 @@ class SelectionMonitor(QObject):
         self._enabled = False
         self._generation += 1
         self._stop_listener()
+
+    def _pause_reason(self, pid: int) -> str:
+        excluded = {name.lower() for name in self.config.excluded_processes}
+        if excluded:
+            name = get_process_name(pid)
+            if name and name.lower() in excluded:
+                return "excluded"
+        if self.config.pause_in_fullscreen and is_fullscreen_now():
+            return "fullscreen"
+        return ""
 
     def _on_click(self, x: float, y: float, button: mouse.Button, pressed: bool) -> None:
         if button != mouse.Button.left:
@@ -149,8 +160,21 @@ class SelectionMonitor(QObject):
             return
         if foreground_class in _SHELL_CLASSES or foreground_class in _CONSOLE_CLASSES:
             return
-        if is_fullscreen_or_busy():
+
+        reason = self._pause_reason(foreground_pid)
+        if reason:
+            if reason != self._pause_state:
+                log.info(
+                    "自动弹窗已暂停（%s）class=%s title=%r",
+                    "全屏" if reason == "fullscreen" else "排除列表",
+                    foreground_class,
+                    foreground_title,
+                )
+                self._pause_state = reason
             return
+        if self._pause_state:
+            log.info("自动弹窗已恢复")
+            self._pause_state = ""
 
         log.info(
             "检测到划选手势 class=%s title=%r distance=%.1f duration=%.2f clicks=%s",

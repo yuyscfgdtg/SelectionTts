@@ -2,7 +2,7 @@
 
 Windows 10/11 的划词朗读原型。Phase 0 先用 Python + PySide6 验证取词、Edge TTS 音质/延迟和托盘交互，确认后再用 C# 重写正式版。
 
-当前进度：**D1–D5 完成**。取词优先走 UI Automation，失败再回退 Ctrl+C；全局快捷键、划词弹窗、通用场景矩阵都已验证。下一步是 D6 全屏/游戏自动暂停。
+当前进度：**D1–D6 完成**。取词优先走 UI Automation，失败再回退 Ctrl+C；全局快捷键、划词弹窗、通用场景矩阵、全屏/进程排除都已验证。下一步是 D7 指标汇总与 go/no-go。
 
 ## 环境要求
 
@@ -33,6 +33,7 @@ uv run selection-tts
 
 - 朗读当前选区
 - 自动弹窗开关
+- 全屏/游戏时暂停自动弹窗
 - 停止朗读
 - 音色：晓晓 / 晓伊 / 云希 / 云健
 - 语速：-20% / 0% / +20% / +50%
@@ -49,10 +50,25 @@ uv run selection-tts
 6. 文本归一化、截断后交给 `edge-tts` 合成 MP3。
 7. 用 `pygame` 播放，支持停止；托盘显示状态。
 8. 划选后弹出无焦点浮窗（`WS_EX_NOACTIVATE`），4 秒无操作自动隐藏；点击「朗读」直接播放已取到的文本，不会再次复制。
+9. 全屏或游戏窗口里自动暂停弹窗；`excluded_processes` 中的程序既不弹窗也不响应热键。
 
 Phase 0 暂未接入：
 
 - 全屏/游戏自动暂停（D6）
+
+## 配置
+
+除托盘菜单外，`%APPDATA%\SelectionTTS\config.json` 还支持：
+
+| 字段 | 默认 | 说明 |
+|---|---|---|
+| `pause_in_fullscreen` | `true` | 全屏/游戏时暂停自动弹窗 |
+| `excluded_processes` | `[]` | 排除的可执行文件名，如 `["Dota2.exe", "KeePass.exe"]`，这些程序里不弹窗也不响应热键 |
+| `use_uia` | `true` | 优先用 UI Automation 取词 |
+| `popup_delay_ms` | `120` | 划选结束后延迟多久取词 |
+| `popup_timeout_ms` | `4000` | 弹窗自动隐藏时间 |
+
+修改配置后需要重启程序。
 
 ## 数据与隐私
 
@@ -74,6 +90,8 @@ Phase 0 暂未接入：
 - Qt/Tk、游戏和部分 Electron 应用不提供 `TextPattern`，同样走剪贴板兜底。
 - DRM 视频、游戏、部分 Java/Electron 应用可能无法复制选区。
 - 划选检测依赖全局鼠标钩子：某些全局鼠标工具、远程桌面或反作弊程序可能拦截钩子。
+- 全屏检测覆盖 D3D 全屏和无边框全屏；个别独占全屏游戏可能识别不到，请把它的 exe 加入 `excluded_processes`。
+- 排除列表按可执行文件名匹配，不区分安装路径。
 - 双击选词、拖选、Shift 点选会弹窗；普通单击不会。终端窗口和桌面/任务栏会被跳过。
 - 弹窗显示期间不会抢焦点，但需要目标窗口本身支持 `Ctrl+C` 复制选区。
 - 剪贴板恢复是尽力而为：文本、HTML、RTF 等全局内存格式可恢复，GDI 句柄类格式（部分图片）暂不恢复。
@@ -96,13 +114,14 @@ uv run python scripts\probe_popup_hide.py  # D3：弹窗超时自动隐藏（无
 uv run python scripts\probe_uia.py         # D4：UIA 直接取词（WPF 目标，不碰剪贴板）
 uv run python scripts\probe_hotkey_uia.py  # D4：热键→UIA→朗读端到端
 uv run python scripts\probe_matrix.py      # D5：通用场景矩阵（记事本/浏览器/终端/Office/PDF）
+uv run python scripts\probe_guard.py       # D6：全屏检测与进程排除
+uv run python scripts\probe_pause.py       # D6：全屏窗口不弹窗（需托盘程序运行）
 ```
 
 `probe_matrix.py` 只取词不播放，可只跑单个场景，例如 `uv run python scripts\probe_matrix.py excel`。
 
 ## 下一步
 
-- D6：全屏/游戏自动暂停、进程排除
 - D7：指标汇总与 go/no-go
 
-详细记录见 `docs/d2-report.md`、`docs/d3-report.md`、`docs/d4-report.md`、`docs/d5-report.md`。
+详细记录见 `docs/d2-report.md`、`docs/d3-report.md`、`docs/d4-report.md`、`docs/d5-report.md`、`docs/d6-report.md`。

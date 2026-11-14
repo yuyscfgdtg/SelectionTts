@@ -66,6 +66,7 @@ def main() -> None:
         mouse = MouseController()
         old = mouse.position
         mouse.position = (left + width // 2, top + height // 2)
+        time.sleep(0.15)
         mouse.click(Button.left, 1)
         time.sleep(0.25)
         mouse.position = old

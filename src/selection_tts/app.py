@@ -16,6 +16,7 @@ from PySide6.QtWidgets import (
 )
 
 from .config import RATES, VOICES, AppConfig, load_config, save_config
+from .foreground import get_foreground_info, get_process_name
 from .hotkeys import HotkeyManager
 from .logging_setup import setup_logging
 from .paths import LOG_DIR, ensure_dirs
@@ -91,6 +92,12 @@ class TrayApp(QObject):
         self.auto_action.triggered.connect(self.toggle_auto_popup)
         self.menu.addAction(self.auto_action)
 
+        self.fullscreen_action = QAction("全屏/游戏时暂停自动弹窗", self.menu)
+        self.fullscreen_action.setCheckable(True)
+        self.fullscreen_action.setChecked(self.config.pause_in_fullscreen)
+        self.fullscreen_action.triggered.connect(self.toggle_fullscreen_pause)
+        self.menu.addAction(self.fullscreen_action)
+
         self.stop_action = QAction("停止朗读", self.menu)
         self.stop_action.triggered.connect(self.reader.stop)
         self.menu.addAction(self.stop_action)
@@ -146,7 +153,20 @@ class TrayApp(QObject):
             self.reader.read_selection(wait_release_ms=0)
 
     def _on_hotkey_read(self) -> None:
+        name = self._excluded_foreground()
+        if name:
+            log.info("前台程序 %s 在排除列表中，跳过热键朗读", name)
+            self._on_status(f"已跳过：{name} 在排除列表中")
+            return
         self.reader.read_selection(wait_release_ms=250)
+
+    def _excluded_foreground(self) -> str:
+        excluded = {item.lower() for item in self.config.excluded_processes}
+        if not excluded:
+            return ""
+        pid = get_foreground_info()[0]
+        name = get_process_name(pid)
+        return name if name and name.lower() in excluded else ""
 
     def _on_selection_ready(self, text: str, x: int, y: int) -> None:
         self.popup.show_for(text, x, y)
@@ -204,6 +224,18 @@ class TrayApp(QObject):
         self.tray.showMessage(
             "划词朗读",
             f"自动弹窗已{state}（快捷键朗读始终可用）",
+            QSystemTrayIcon.MessageIcon.Information,
+            2200,
+        )
+
+    def toggle_fullscreen_pause(self) -> None:
+        self.config.pause_in_fullscreen = not self.config.pause_in_fullscreen
+        self.fullscreen_action.setChecked(self.config.pause_in_fullscreen)
+        save_config(self.config)
+        state = "开启" if self.config.pause_in_fullscreen else "关闭"
+        self.tray.showMessage(
+            "划词朗读",
+            f"全屏/游戏时暂停自动弹窗已{state}",
             QSystemTrayIcon.MessageIcon.Information,
             2200,
         )

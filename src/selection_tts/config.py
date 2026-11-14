@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import json
 import logging
-from dataclasses import asdict, dataclass, fields
+from dataclasses import asdict, dataclass, field, fields
 from pathlib import Path
 
 from .paths import CONFIG_PATH, ensure_dirs
@@ -37,6 +37,8 @@ class AppConfig:
     popup_delay_ms: int = 120
     popup_timeout_ms: int = 4000
     min_selection_chars: int = 1
+    pause_in_fullscreen: bool = True
+    excluded_processes: list[str] = field(default_factory=list)
     edge_proxy: str = ""
     engine: str = "edge"
     azure_region: str = ""
@@ -55,6 +57,17 @@ def _sanitize(config: AppConfig) -> AppConfig:
     config.popup_delay_ms = max(0, min(int(config.popup_delay_ms), 2_000))
     config.popup_timeout_ms = max(500, min(int(config.popup_timeout_ms), 20_000))
     config.min_selection_chars = max(1, min(int(config.min_selection_chars), 100))
+    config.pause_in_fullscreen = bool(config.pause_in_fullscreen)
+    excluded: list[str] = []
+    for name in config.excluded_processes or []:
+        name = str(name).strip()
+        if not name:
+            continue
+        if not name.lower().endswith(".exe"):
+            name = f"{name}.exe"
+        if name.lower() not in {item.lower() for item in excluded}:
+            excluded.append(name)
+    config.excluded_processes = excluded
     return config
 
 
