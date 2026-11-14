@@ -1,0 +1,60 @@
+<Window x:Class="SelectionTts.Ui.SettingsWindow"
+        xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
+        xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+        Title="设置" Width="560" SizeToContent="Height"
+        WindowStartupLocation="CenterScreen" ResizeMode="NoResize"
+        FontSize="13" Topmost="True">
+
+    <StackPanel Margin="20,18,20,16">
+        <TextBlock Text="合成引擎" FontSize="14" FontWeight="SemiBold"/>
+
+        <RadioButton x:Name="EdgeRadio" Margin="0,10,0,0"
+                     Content="Edge（默认 · 免费 · 无需配置）"/>
+        <RadioButton x:Name="AzureRadio" Margin="0,6,0,0"
+                     Content="Azure（备用 · 需要订阅 Key）"/>
+
+        <Grid x:Name="AzurePanel" Margin="26,10,0,0">
+            <Grid.ColumnDefinitions>
+                <ColumnDefinition Width="Auto"/>
+                <ColumnDefinition Width="*"/>
+            </Grid.ColumnDefinitions>
+            <Grid.RowDefinitions>
+                <RowDefinition Height="Auto"/>
+                <RowDefinition Height="Auto"/>
+                <RowDefinition Height="Auto"/>
+                <RowDefinition Height="Auto"/>
+            </Grid.RowDefinitions>
+
+            <TextBlock Grid.Row="0" Grid.Column="0" Text="区域" VerticalAlignment="Center" Margin="0,0,10,0"/>
+            <TextBox Grid.Row="0" Grid.Column="1" x:Name="RegionBox" Height="26"
+                     VerticalContentAlignment="Center" ToolTip="例如 eastasia、eastus"/>
+
+            <TextBlock Grid.Row="1" Grid.Column="0" Text="Key" VerticalAlignment="Center" Margin="0,8,10,0"/>
+            <Grid Grid.Row="1" Grid.Column="1" Margin="0,8,0,0">
+                <PasswordBox x:Name="KeyPassword" Height="26" VerticalContentAlignment="Center"/>
+                <TextBox x:Name="KeyText" Height="26" VerticalContentAlignment="Center" Visibility="Collapsed"/>
+            </Grid>
+
+            <CheckBox Grid.Row="2" Grid.Column="1" x:Name="RevealKey" Content="显示 Key" Margin="0,8,0,0"/>
+
+            <StackPanel Grid.Row="3" Grid.Column="1" Orientation="Horizontal" Margin="0,10,0,0">
+                <Button x:Name="TestButton" Content="测试合成" Padding="12,4"/>
+                <TextBlock x:Name="TestResult" Margin="10,0,0,0" VerticalAlignment="Center"
+                           Foreground="#6B7280" TextWrapping="Wrap" MaxWidth="320"/>
+            </StackPanel>
+        </Grid>
+
+        <Separator Margin="0,18,0,14"/>
+
+        <TextBlock Text="快捷键" FontSize="14" FontWeight="SemiBold"/>
+        <StackPanel x:Name="HotkeyRows" Margin="0,8,0,0"/>
+
+        <Separator Margin="0,16,0,14"/>
+
+        <StackPanel Orientation="Horizontal" HorizontalAlignment="Right">
+            <Button x:Name="CancelButton" Content="取消" MinWidth="84" Padding="12,6"/>
+            <Button x:Name="SaveButton" Content="保存" MinWidth="84" Padding="12,6"
+                    Margin="8,0,0,0" IsDefault="True"/>
+        </StackPanel>
+    </StackPanel>
+</Window>

@@ -59,7 +59,7 @@ public sealed class ReaderService : IDisposable
     private readonly record struct WordSpan(int End, double StartSeconds);
 
     private readonly AppSettings _settings;
-    private readonly ISpeechSynthesizer _engine;
+    private ISpeechSynthesizer _engine;
     private readonly StreamingAudioPlayer _player = new();
     private readonly object _gate = new();
     private readonly System.Threading.Timer _timer;
@@ -125,6 +125,9 @@ public sealed class ReaderService : IDisposable
                 _error);
         }
     }
+
+    /// <summary>切换合成引擎，下一条朗读生效（正在朗读的那条不受影响）。</summary>
+    public void SetEngine(ISpeechSynthesizer engine) => _engine = engine;
 
     /// <summary>新的朗读目标。整篇替换，旧的一律作废。</summary>
     public void Speak(string text)
@@ -373,7 +376,7 @@ public sealed class ReaderService : IDisposable
 
             Log.Info(
                 $"朗读 {text.Length} 字 | 分块={runtime.Count} | 首声={firstAudioAt}ms | " +
-                $"合成总耗时={watch.ElapsedMilliseconds}ms | 引擎={_settings.Engine}");
+                $"合成总耗时={watch.ElapsedMilliseconds}ms | 引擎={_engine.Name}");
 
             // 等所有音频写进缓冲（缓冲只有 10 秒，所以这里会随播放推进而逐步完成）
             await writer;

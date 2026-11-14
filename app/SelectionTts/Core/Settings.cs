@@ -20,6 +20,15 @@ public sealed class AppSettings
 
     /// <summary>朗读板是否显示（用户点 × 隐藏后不再自动弹出）。</summary>
     public bool BoardVisible { get; set; } = true;
+
+    /// <summary>Azure 备用引擎的区域，例如 eastasia。</summary>
+    public string AzureRegion { get; set; } = "";
+
+    /// <summary>Azure Key（DPAPI 加密后的 Base64，不存明文）。</summary>
+    public string AzureKeyProtected { get; set; } = "";
+
+    /// <summary>动作 id → 组合键文本，例如 "toggle-watch": "Ctrl+Alt+R"。</summary>
+    public Dictionary<string, string> Hotkeys { get; set; } = [];
 }
 
 public static class SettingsStore
@@ -91,5 +100,6 @@ public static class SettingsStore
         }
 
         settings.MaxChars = Math.Clamp(settings.MaxChars, 50, 20000);
+        settings.Hotkeys ??= [];
     }
 }

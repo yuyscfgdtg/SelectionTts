@@ -29,6 +29,9 @@ public sealed class TrayIconManager : IDisposable
     public event Action? StopRequested;
     public event Action? ToggleWatchRequested;
     public event Action? ToggleBoardRequested;
+    public event Action? SettingsRequested;
+
+    private string _hotkeyText = "Ctrl+Alt+R";
 
     public TrayIconManager(AppSettings settings)
     {
@@ -61,6 +64,7 @@ public sealed class TrayIconManager : IDisposable
         menu.Items.Add(BuildVoiceMenu());
         menu.Items.Add(BuildRateMenu());
         menu.Items.Add(new ToolStripSeparator());
+        menu.Items.Add(new ToolStripMenuItem("设置…", null, (_, _) => SettingsRequested?.Invoke()));
         menu.Items.Add(new ToolStripMenuItem("打开数据目录", null, (_, _) => OpenDataDir()));
         menu.Items.Add(new ToolStripMenuItem("打开日志", null, (_, _) => OpenLog()));
         menu.Items.Add(new ToolStripSeparator());
@@ -98,11 +102,22 @@ public sealed class TrayIconManager : IDisposable
 
     public void SetBoardVisible(bool visible) => _boardItem.Checked = visible;
 
+    public void SetHotkeyText(string text)
+    {
+        if (string.IsNullOrWhiteSpace(text))
+        {
+            return;
+        }
+
+        _hotkeyText = text;
+        UpdateEnabledText();
+    }
+
     private void UpdateEnabledText()
     {
         _enabledItem.Text = _enabled
-            ? "● 朗读已启用（点击关闭）"
-            : "○ 朗读已关闭（点击启用）";
+            ? $"● 朗读已启用（点击关闭）    {_hotkeyText}"
+            : $"○ 朗读已关闭（点击启用）    {_hotkeyText}";
     }
 
     /// <summary>托盘悬停提示，最多 63 个字符（Win32 限制）。</summary>

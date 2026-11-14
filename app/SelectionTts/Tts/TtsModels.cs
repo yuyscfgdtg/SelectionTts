@@ -23,6 +23,9 @@ public sealed record SynthesisSummary(int AudioBytes, int BoundaryCount, int Ela
 /// </summary>
 public interface ISpeechSynthesizer
 {
+    /// <summary>给日志和界面用的引擎名，例如 Edge / Azure。</summary>
+    string Name { get; }
+
     Task<SynthesisSummary> StreamAsync(
         string text,
         string voice,

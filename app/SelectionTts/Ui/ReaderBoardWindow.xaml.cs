@@ -96,6 +96,15 @@ public partial class ReaderBoardWindow : Window
         Render();
     }
 
+    /// <summary>底部提示跟着当前热键走，改过热键之后不会显示旧组合。</summary>
+    public void SetHotkeyText(string text)
+    {
+        if (!string.IsNullOrWhiteSpace(text))
+        {
+            HintText.Text = $"{text} 开关";
+        }
+    }
+
     public void ShowBoard()
     {
         if (!IsVisible)

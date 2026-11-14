@@ -3,6 +3,7 @@ using System.Windows;
 using SelectionTts.Core;
 using SelectionTts.Platform;
 using SelectionTts.Tray;
+using SelectionTts.Tts;
 
 namespace SelectionTts;
 
@@ -53,6 +54,12 @@ public partial class App : System.Windows.Application
             return;
         }
 
+        if (e.Args.Contains("--selftest-config"))
+        {
+            RunConfigSelfTest();
+            return;
+        }
+
         _instanceMutex = new Mutex(true, @"Local\SelectionTts.SingleInstance", out var createdNew);
         if (!createdNew)
         {
@@ -64,7 +71,7 @@ public partial class App : System.Windows.Application
         Log.Info($"启动 SelectionTts {typeof(App).Assembly.GetName().Version} | 数据目录 {AppPaths.DataDir}");
 
         _settings = SettingsStore.Load();
-        _reader = new ReaderService(_settings);
+        _reader = new ReaderService(_settings, CreateEngine());
         _tray = new TrayIconManager(_settings);
         _hotkeys = new HotkeyManager();
         _watcher = new ClipboardWatcher();
@@ -78,8 +85,20 @@ public partial class App : System.Windows.Application
             _board.ToggleBoard();
             _tray.SetBoardVisible(_board.IsBoardVisible);
         };
+        _tray.SettingsRequested += OpenSettings;
 
-        _hotkeys.ToggleWatchRequested += () => Dispatcher.Invoke(() => SetWatching(!_watching, persist: true));
+        _hotkeys.Pressed += actionId => Dispatcher.Invoke(() =>
+        {
+            switch (actionId)
+            {
+                case "toggle-watch":
+                    SetWatching(!_watching, persist: true);
+                    break;
+                default:
+                    Log.Warn($"未处理的热键动作 {actionId}");
+                    break;
+            }
+        });
 
         _reader.StatusChanged += status => Dispatcher.Invoke(() =>
         {
@@ -96,10 +115,7 @@ public partial class App : System.Windows.Application
         // 复制即读：新内容直接顶掉正在朗读的旧内容
         _watcher.TextCopied += text => _reader.Speak(text);
 
-        if (!_hotkeys.RegisterDefaults())
-        {
-            _tray.Notify("快捷键注册失败，可能已被其他程序占用");
-        }
+        ApplyHotkeys();
 
         if (_settings.BoardVisible)
         {
@@ -109,7 +125,89 @@ public partial class App : System.Windows.Application
         var startWatching = _settings.WatchEnabled || e.Args.Contains("--watch");
         SetWatching(startWatching, persist: false);
 
+        if (e.Args.Contains("--settings"))
+        {
+            Dispatcher.BeginInvoke(new Action(OpenSettings));
+        }
+
         Log.Info("初始化完成");
+    }
+
+    private ISpeechSynthesizer CreateEngine()
+    {
+        if (_settings is not null &&
+            string.Equals(_settings.Engine, "azure", StringComparison.OrdinalIgnoreCase))
+        {
+            var key = Dpapi.Unprotect(_settings.AzureKeyProtected);
+            var client = new Tts.AzureTtsClient(_settings.AzureRegion, key);
+            if (client.IsConfigured)
+            {
+                Log.Info($"引擎：Azure（{_settings.AzureRegion}）");
+                return client;
+            }
+
+            Log.Warn("配置为 Azure 但缺少区域或 Key，回退到 Edge");
+        }
+
+        return new Tts.EdgeTtsClient();
+    }
+
+    private void ApplyHotkeys()
+    {
+        if (_settings is null || _hotkeys is null || _tray is null)
+        {
+            return;
+        }
+
+        var desired = new List<(string ActionId, HotkeyGesture Gesture)>();
+
+        foreach (var action in HotkeyActions.All)
+        {
+            var text = _settings.Hotkeys.GetValueOrDefault(action.Id);
+            if (!HotkeyGesture.TryParse(text, out var gesture) &&
+                !HotkeyGesture.TryParse(action.DefaultGesture, out gesture))
+            {
+                Log.Warn($"热键 {action.Id} 的配置无效，已跳过");
+                continue;
+            }
+
+            desired.Add((action.Id, gesture));
+        }
+
+        if (_hotkeys.TryApply(desired, out var error))
+        {
+            var text = _hotkeys.Describe(HotkeyActions.ToggleWatch.Id);
+            _tray.SetHotkeyText(text);
+            _board?.SetHotkeyText(text);
+            return;
+        }
+
+        Log.Warn($"热键注册失败：{error}");
+        _tray.Notify(error + "（旧热键仍然可用）");
+    }
+
+    private void OpenSettings()
+    {
+        if (_settings is null || _reader is null || _tray is null || _hotkeys is null)
+        {
+            return;
+        }
+
+        var window = new Ui.SettingsWindow(_settings)
+        {
+            SuspendHotkeys = () => _hotkeys.UnregisterAll(),
+            ResumeHotkeys = ApplyHotkeys,
+        };
+
+        window.ShowDialog();
+
+        if (!window.Saved)
+        {
+            return;
+        }
+
+        _reader.SetEngine(CreateEngine());
+        _tray.Notify("设置已保存");
     }
 
     private void SetWatching(bool on, bool persist)
@@ -274,6 +372,95 @@ public partial class App : System.Windows.Application
         reader.Dispose();
         Log.Info("selftest pipeline done");
         Shutdown(0);
+    }
+
+    /// <summary>
+    /// 验证配置相关能力：DPAPI 加解密、热键注册/换绑/冲突回滚。
+    /// </summary>
+    private async void RunConfigSelfTest()
+    {
+        try
+        {
+            const string secret = "abcdef0123456789abcdef0123456789";
+            var protectedText = Dpapi.Protect(secret);
+            var roundtrip = Dpapi.Unprotect(protectedText);
+            Log.Info(
+                $"selftest dpapi | 密文长度={protectedText.Length} | 不是明文={protectedText != secret} | " +
+                $"还原一致={roundtrip == secret}");
+
+            var manager = new HotkeyManager();
+
+            var first = manager.TryApply(
+                [("toggle-watch", new HotkeyGesture(HotkeyGesture.ModControl | HotkeyGesture.ModAlt, 0x79))],
+                out var firstError);
+            Log.Info($"selftest hotkey 首次注册={first} | 错误=[{firstError}] | 当前={manager.Describe("toggle-watch")}");
+
+            var rebind = manager.TryApply(
+                [("toggle-watch", new HotkeyGesture(HotkeyGesture.ModControl | HotkeyGesture.ModAlt, 0x7A))],
+                out var rebindError);
+            Log.Info($"selftest hotkey 换绑={rebind} | 错误=[{rebindError}] | 当前={manager.Describe("toggle-watch")}");
+
+            // Ctrl+Alt+Delete 被系统保留，注册必然失败：用来验证"失败后旧热键仍在"
+            var conflict = manager.TryApply(
+                [("toggle-watch", new HotkeyGesture(HotkeyGesture.ModControl | HotkeyGesture.ModAlt, 0x2E))],
+                out var conflictError);
+            Log.Info(
+                $"selftest hotkey 冲突={conflict} | 错误=[{conflictError}] | " +
+                $"回滚后={manager.Describe("toggle-watch")}");
+
+            manager.Dispose();
+
+            // 配置往返：验证"设置窗口保存 → 重启读取"这条链路（含 DPAPI 字段）
+            var backup = File.Exists(AppPaths.ConfigPath)
+                ? File.ReadAllText(AppPaths.ConfigPath)
+                : "";
+
+            try
+            {
+                var probe = SettingsStore.Load();
+                probe.Engine = "azure";
+                probe.AzureRegion = "eastasia";
+                probe.AzureKeyProtected = Dpapi.Protect("test-key-123456");
+                probe.Hotkeys[HotkeyActions.ToggleWatch.Id] = "Ctrl+Shift+F9";
+                SettingsStore.Save(probe);
+
+                var reloaded = SettingsStore.Load();
+                var key = Dpapi.Unprotect(reloaded.AzureKeyProtected);
+                Log.Info(
+                    $"selftest config 往返 | 引擎={reloaded.Engine} | 区域={reloaded.AzureRegion} | " +
+                    $"Key还原一致={key == "test-key-123456"} | 热键={reloaded.Hotkeys.GetValueOrDefault("toggle-watch")}");
+
+                // 故意用错 Key，确认失败信息是给人看得懂的那种
+                var azure = new Tts.AzureTtsClient(reloaded.AzureRegion, key);
+                try
+                {
+                    using var buffer = new MemoryStream();
+                    await azure.StreamAsync(
+                        "测试", reloaded.Voice, reloaded.Rate,
+                        chunk => buffer.Write(chunk.Span), null, CancellationToken.None);
+                    Log.Warn("selftest azure 用错误 Key 竟然成功了，需要复查");
+                }
+                catch (Exception ex)
+                {
+                    Log.Info($"selftest azure 错误 Key 的提示：{ex.Message}");
+                }
+            }
+            finally
+            {
+                if (backup.Length > 0)
+                {
+                    File.WriteAllText(AppPaths.ConfigPath, backup);
+                }
+            }
+        }
+        catch (Exception ex)
+        {
+            Log.Error("selftest config failed", ex);
+        }
+        finally
+        {
+            Shutdown(0);
+        }
     }
 
     private async void RunTtsSelfTest()

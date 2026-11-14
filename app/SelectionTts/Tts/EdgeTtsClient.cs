@@ -20,6 +20,8 @@ public sealed class EdgeTtsClient : ISpeechSynthesizer
 {
     private const string OutputFormat = "audio-24khz-48kbitrate-mono-mp3";
 
+    public string Name => "Edge";
+
     private static readonly string UserAgent =
         "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 " +
         $"(KHTML, like Gecko) Chrome/{DrmToken.ChromiumVersion.Split('.')[0]}.0.0.0 " +
