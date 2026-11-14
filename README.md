@@ -1,132 +1,136 @@
-# 划词朗读（Selection TTS）
+# 剪贴板朗读（SelectionTts）
 
-Windows 10/11 的划词朗读原型。Phase 0 先用 Python + PySide6 验证取词、Edge TTS 音质/延迟和托盘交互，确认后再用 C# 重写正式版。
+Windows 10/11 托盘小工具：**复制文本，自动朗读**，并在一个常驻的「朗读板」里显示内容、合成进度和当前读到哪一行。
 
-当前进度：**D1–D7 完成，Phase 0 通过（go）**。取词优先走 UI Automation，失败再回退 Ctrl+C；全局快捷键、划词弹窗、通用场景矩阵、全屏/进程排除、朗读打断都已验证。下一步是按 `docs\d7-report.md` 的要求用 C# 重写正式版。
+基于 Edge「大声朗读」同一个在线语音引擎（免费、无需 API Key），支持配置 Azure 语音作为备用引擎。
 
-## 环境要求
+![朗读板](docs/images/board.png)
 
-- Windows 10 22H2 / Windows 11
-- [uv](https://docs.astral.sh/uv/) 0.13+
-- 首次运行会自动使用 Python 3.12（`.python-version` 已固定）
+## 特性
 
-## 安装与运行
+- **复制即读**：监听系统剪贴板，`Ctrl+C` 后自动朗读；新内容立即打断旧内容
+- **朗读板**：无焦点浮窗，按板子宽度逐行排版，读到哪行哪行高亮，**点任意一行就从那一行的句子开始读**
+- **句级缓存**：一句话一个音频块，跳回已合成的位置 2–5ms 出声，不重新合成
+- **合成进度条**：始终以全文为分母，跳转不重置；合成完自动收起
+- **总开关**：托盘图标灰度 + `Ctrl+Alt+R` + 板子按钮，关掉即停止并清空缓存
+- **暂停 / 继续**：只作用于当前这一段
+- **备用引擎**：Azure 语音（手动切换，Key 用 Windows DPAPI 加密）
+- **可配置热键**：默认 `Ctrl+Alt+R`，冲突时自动回滚
+- **开机自启**：设置里勾选，写的是启动文件夹快捷方式（可在任务管理器里看到）
+- 日志只记字数，不记录复制内容
 
-```powershell
-cd D:\桌面\TTS
-uv sync
-uv run selection-tts
+## 安装
+
+从 [Releases](../../releases) 下载 `SelectionTts-Setup-x.y.z.exe`，双击安装：
+
+- **不需要管理员权限**，默认装到 `%LOCALAPPDATA%\Programs\SelectionTts`
+- 安装时可勾选「开机自动启动」「桌面快捷方式」
+- 卸载在「设置 → 应用」或运行安装目录的 `unins000.exe`
+- **卸载会保留 `data\`（设置和日志）**，卸载提示里可确认是否删除
+- 覆盖安装即升级，配置保留
+
+> 程序没有数字签名，首次运行 Windows SmartScreen 会提示，点「更多信息 → 仍要运行」即可。
+
+也可以直接用免安装版：`publish\win-x64\SelectionTts.exe`（单文件，设置和日志写在 exe 旁的 `data\`）。
+
+## 使用
+
+1. 启动后托盘出现图标，默认**灰色 = 已关闭**
+2. 按 `Ctrl+Alt+R` 或托盘菜单首项启用（图标变彩色）
+3. 在任意程序里复制文本，朗读板立刻显示内容并开始朗读
+
+| 操作 | 效果 |
+|---|---|
+| `Ctrl+Alt+R` | 开/关朗读（软件总开关） |
+| 板子上 `暂停` / `继续` | 临时停止当前这段 |
+| 板子上 `停止` / `启动` | 等同于总开关 |
+| 点板子上某一行 | 从该行所在句子开始读 |
+| 托盘 → 设置… | 引擎、Azure Key、热键、开机自启 |
+| 托盘 → 显示朗读板 | 重新打开被 `×` 隐藏的板子 |
+
+![设置窗口](docs/images/settings.png)
+
+## 朗读板的行为
+
+```
+正在合成 54%            ← 进度条只表示合成到哪了，合成完自动收起
+已合成 2100/5000 字
+
+第一行……                ← 正在读的这一行整行高亮（高亮就是播放进度）
+第二行……
 ```
 
-启动后程序常驻系统托盘，不显示主窗口。
+- 正文按板子宽度自动折行，**一行就是一个可点的单元格**
+- 点某一行 → 引擎落到**这一行所在句子的开头**（行可能只是半句，没有音频时间戳时这是最精确的位置）
+- 跳到**已合成**的位置：直接播缓存，零等待
+- 跳到**未合成**的位置：合成立刻跳到那一句、边合成边读
+- 读到结尾就算读完；中间跳过的句子会在后台静默补齐（不出声），进度条补到 100%
+- 复制新文本 / 关总开关：旧文本和全部音频缓存立即丢弃
 
-## 快捷键
+## 隐私
 
-| 快捷键 | 功能 |
-|---|---|
-| `Ctrl+Alt+R` | 朗读当前选区 |
-| `Ctrl+Alt+Shift+P` | 开启/关闭自动弹窗 |
-
-> 原计划的 `Ctrl+Alt+P` 在这台机器上已被其他程序占用（Win32 错误 1409），因此默认改为 `Ctrl+Alt+Shift+P`。快捷键可在 `%APPDATA%\SelectionTTS\config.json` 中修改。
-
-## 托盘菜单
-
-- 朗读当前选区
-- 自动弹窗开关
-- 全屏/游戏时暂停自动弹窗
-- 停止朗读
-- 音色：晓晓 / 晓伊 / 云希 / 云健
-- 语速：-20% / 0% / +20% / +50%
-- 打开日志目录
-- 退出
-
-## 当前实现方式
-
-1. 全局快捷键由 Win32 `RegisterHotKey` 注册，不依赖低层键盘钩子。
-2. 取词顺序：先用 UI Automation 读取焦点控件的 `TextPattern` 选区（不碰剪贴板），失败再回退 `Ctrl+C`。
-3. 快捷朗读：等待 250ms 让快捷键松开，再执行取词。
-4. 鼠标划选：低层鼠标钩子检测拖选、双击选词和 Shift 点选；松开后延迟 120ms 取词。
-5. 剪贴板兜底：读取文本后尽力恢复触发前的内容。
-6. 文本归一化、截断后交给 `edge-tts` 合成 MP3。
-7. 用 `pygame` 播放，支持停止；托盘显示状态。
-8. 划选后弹出无焦点浮窗（`WS_EX_NOACTIVATE`），4 秒无操作自动隐藏；点击「朗读」直接播放已取到的文本，不会再次复制。
-9. 全屏或游戏窗口里自动暂停弹窗；`excluded_processes` 中的程序既不弹窗也不响应热键。
-10. 朗读中再次划词或按热键会立即打断当前朗读，直接开始新的内容，无需先点「停止」。
-
-Phase 0 结论（`docs\d7-report.md`）：26 次朗读全部成功，弹窗取词中位数 9ms，UIA 覆盖 69%；短文本合成 p50 1.6s。唯一要带到正式版解决的是长文本合成等待——1410 字需要 12.6s，正式版改为分段流水线播放。
-
-## 配置
-
-除托盘菜单外，`%APPDATA%\SelectionTTS\config.json` 还支持：
-
-| 字段 | 默认 | 说明 |
-|---|---|---|
-| `pause_in_fullscreen` | `true` | 全屏/游戏时暂停自动弹窗 |
-| `excluded_processes` | `[]` | 排除的可执行文件名，如 `["Dota2.exe", "KeePass.exe"]`，这些程序里不弹窗也不响应热键 |
-| `use_uia` | `true` | 优先用 UI Automation 取词 |
-| `popup_delay_ms` | `120` | 划选结束后延迟多久取词 |
-| `popup_timeout_ms` | `4000` | 弹窗自动隐藏时间 |
-
-修改配置后需要重启程序。
-
-## 数据与隐私
-
-- 配置：`%APPDATA%\SelectionTTS\config.json`
-- 日志：`%LOCALAPPDATA%\SelectionTTS\logs\app.log`
-- 指标：`%LOCALAPPDATA%\SelectionTTS\metrics.jsonl`
-- 临时音频：`%LOCALAPPDATA%\SelectionTTS\cache\`
-
-日志和指标**不记录选中的文本内容**，只记录字符数、耗时、音色、错误码等。朗读文本会发送到 Microsoft Edge TTS 在线接口，请自行评估隐私影响。
+- 文本是发送到**微软的在线语音服务**（Edge 或 Azure）合成的，这一点无法避免
+- 朗读板是**内存里的临时缓存**：换文本或关总开关即释放，不落盘
+- 日志只记录字数、耗时、状态，不记录任何复制内容
+- Azure Key 用 Windows DPAPI 加密后存进配置，只对当前用户可解密
 
 ## 已知限制
 
-- 管理员权限运行的程序：普通权限进程无法向它发送 `Ctrl+C`；UIA 通常也读不到，视为不支持。
-- 终端窗口：剪贴板兜底会被跳过；如果终端提供 UIA `TextPattern`（如 Windows Terminal），仍可通过 UIA 读取。
-- 浏览器：Chrome/Edge 在收到无障碍查询后通常能通过 UIA 取词，失败时回退剪贴板。
-- 资源管理器等文件管理器：选中的是文件而不是文本，会主动跳过（不发送 `Ctrl+C`，也不改动剪贴板）。
-- PDF 阅读器：UIA 能取到文本，但 PDF 文本层可能丢失空格或连字符。
-- Excel：走剪贴板兜底，且采用延迟渲染，取词可能比其它应用慢（约 0.1–1.5s）。
-- Qt/Tk、游戏和部分 Electron 应用不提供 `TextPattern`，同样走剪贴板兜底。
-- DRM 视频、游戏、部分 Java/Electron 应用可能无法复制选区。
-- 划选检测依赖全局鼠标钩子：某些全局鼠标工具、远程桌面或反作弊程序可能拦截钩子。
-- 全屏检测覆盖 D3D 全屏和无边框全屏；个别独占全屏游戏可能识别不到，请把它的 exe 加入 `excluded_processes`。
-- 排除列表按可执行文件名匹配，不区分安装路径。
-- 双击选词、拖选、Shift 点选会弹窗；普通单击不会。终端窗口和桌面/任务栏会被跳过。
-- 弹窗显示期间不会抢焦点，但需要目标窗口本身支持 `Ctrl+C` 复制选区。
-- 剪贴板恢复是尽力而为：文本、HTML、RTF 等全局内存格式可恢复，GDI 句柄类格式（部分图片）暂不恢复。
-- Edge TTS 是非官方接口，可能限流或变更；正式版会加 Azure 引擎和本地引擎兜底。
-- 长文本要等整段合成完才出声：1410 字约 12.6s，期间只有「正在合成…」提示。正式版改为按句分段、边合成边播放。
-- Phase 0 从终端启动时带控制台窗口；正式版会改为无控制台托盘程序。
+- 依赖网络；断网无法朗读
+- 单次最长 5000 字，超出截断
+- 合成单位是「一句话」：请求数比整段合成多（5000 字约 100+ 次），首次把缓存填满约需 1 分钟——播放本身要十几分钟，所以合成始终跑在播放前面
+- Azure 免费层有每分钟请求数限制，撞到 429 会等待重试，表现为进度条暂时停住
+- Edge 接口的令牌算法会随版本变化，升级时需同步 `Tts/DrmToken.cs`
 
-## 验证脚本
+## 构建
 
-需要先启动 `uv run selection-tts`（除 D1 探针外）：
+需要 .NET SDK 10 与 [Inno Setup 6](https://jrsoftware.org/isinfo.php)（仅打包安装包时需要）。
 
 ```powershell
-uv run python scripts\probe_edge_tts.py    # D1：音色列表 + 首音/总合成耗时
-uv run python scripts\probe_play.py        # D1：pygame 播放 probe_zh.mp3
-uv run python scripts\probe_selection.py   # D2：Tk 选区 + Ctrl+C + 剪贴板恢复
-uv run python scripts\probe_pipeline.py    # D2：合成 + 播放
-uv run python scripts\probe_hotkey.py      # D2：真实全局热键端到端（会播放声音）
-uv run python scripts\probe_toggle.py      # D2：自动弹窗开关热键
-uv run python scripts\probe_popup.py       # D3：拖选→弹窗→点击朗读→焦点不丢失
-uv run python scripts\probe_popup_hide.py  # D3：弹窗超时自动隐藏（无需托盘程序）
-uv run python scripts\probe_uia.py         # D4：UIA 直接取词（WPF 目标，不碰剪贴板）
-uv run python scripts\probe_hotkey_uia.py  # D4：热键→UIA→朗读端到端
-uv run python scripts\probe_matrix.py      # D5：通用场景矩阵（记事本/浏览器/终端/Office/PDF）
-uv run python scripts\probe_guard.py       # D6：全屏检测与进程排除
-uv run python scripts\probe_pause.py       # D6：全屏窗口不弹窗（需托盘程序运行）
-uv run python scripts\probe_interrupt.py   # D7：新朗读请求打断旧朗读（静音，不发声）
+cd app\SelectionTts
+
+# 单文件版
+dotnet publish -c Release -r win-x64 --self-contained true -p:PublishSingleFile=true `
+  -p:IncludeNativeLibrariesForSelfExtract=true -p:EnableCompressionInSingleFile=true `
+  -o publish\win-x64
+
+# 安装包
+& "$env:LOCALAPPDATA\Programs\Inno Setup 6\ISCC.exe" installer\SelectionTts.iss
 ```
 
-`probe_matrix.py` 只取词不播放，可只跑单个场景，例如 `uv run python scripts\probe_matrix.py excel`。
+产物：
 
-## 下一步
+- `publish\win-x64\SelectionTts.exe` — 单文件，目标机不需要装 .NET
+- `installer\output\SelectionTts-Setup-x.y.z.exe` — 一键安装包
 
-Phase 0 结束，进入 C# 正式版重写：
+## 目录结构
 
-- 按 `docs/d7-report.md` 的“对 C# 正式版的要求”建项目骨架
-- 先跑通「热键 → UIA/剪贴板 → Edge TTS 流式 → 播放」主线
-- 再补无焦点浮窗、托盘、设置界面、打包单文件 exe
+```
+app/SelectionTts/
+  App.xaml.cs            启动、托盘与热键接线
+  Core/
+    ReaderService.cs     朗读编排：句级缓存、seek、合成调度
+    TextSegmenter.cs     按句切分
+    Settings.cs          配置读写
+  Tts/
+    EdgeTtsClient.cs     Edge 接口（WebSocket，带词时间戳）
+    AzureTtsClient.cs    Azure 接口（REST，备用）
+  Audio/StreamingAudioPlayer.cs   PCM 缓冲连续播放
+  Ui/ReaderBoardWindow.xaml      朗读板
+  Ui/SettingsWindow.xaml         设置
+  Platform/                      剪贴板、热键、DPAPI、自启
+  installer/SelectionTts.iss     安装包脚本
+docs/
+  d2-report.md … d7-report.md     早期原型阶段的验证报告
+  images/                        截图
+```
 
-详细记录见 `docs/d2-report.md`、`docs/d3-report.md`、`docs/d4-report.md`、`docs/d5-report.md`、`docs/d6-report.md`、`docs/d7-report.md`。
+## 关于 Phase 0
+
+最初的形态是「划词朗读」：选中文字后弹按钮朗读。Phase 0 用 Python + PySide6 验证了取词、Edge TTS 延迟、弹窗交互和打断行为（见 `docs/d2`–`d7`），结论是可行但交互打扰太大，最终改为现在的**剪贴板朗读 + 朗读板**形态，并用 C# 重写。
+
+原型代码已删除，验证结论保留在文档里。
+
+## 许可证
+
+[MIT](LICENSE)
