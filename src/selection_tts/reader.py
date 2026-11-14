@@ -27,13 +27,14 @@ class ReaderService(QObject):
         self.config = config
         self._player = AudioPlayer()
         self._engine = EdgeTtsEngine(proxy=config.edge_proxy)
-        self._busy = threading.Lock()
-        self._stop = threading.Event()
+        self._lock = threading.Lock()
+        self._request_id = 0
         self._thread: threading.Thread | None = None
 
     @property
     def is_busy(self) -> bool:
-        return self._busy.locked()
+        thread = self._thread
+        return thread is not None and thread.is_alive()
 
     def read_selection(self, wait_release_ms: int = 250) -> None:
         self._start(wait_release_ms=wait_release_ms, preloaded_text=None, source="clipboard")
@@ -43,27 +44,37 @@ class ReaderService(QObject):
         self._start(wait_release_ms=0, preloaded_text=text, source="popup")
 
     def _start(self, wait_release_ms: int, preloaded_text: str | None, source: str) -> None:
-        if not self._busy.acquire(blocking=False):
-            self.status.emit("正在朗读中，请先停止")
-            return
-        self._stop.clear()
+        # A new request always wins: silence the current audio immediately, then
+        # let the older worker notice it is stale and clean up after itself.
+        with self._lock:
+            self._request_id += 1
+            generation = self._request_id
+            self._player.stop()
+            if self._thread is not None and self._thread.is_alive():
+                log.info("新的朗读请求，打断上一次朗读")
         self._thread = threading.Thread(
             target=self._worker,
-            args=(wait_release_ms, preloaded_text, source),
+            args=(wait_release_ms, preloaded_text, source, generation),
             daemon=True,
             name="reader",
         )
         self._thread.start()
 
     def stop(self) -> None:
-        self._stop.set()
-        self._player.stop()
+        with self._lock:
+            self._request_id += 1
+            self._player.stop()
+
+    def _is_stale(self, generation: int) -> bool:
+        with self._lock:
+            return generation != self._request_id
 
     def _worker(
         self,
         wait_release_ms: int,
         preloaded_text: str | None,
         source: str,
+        generation: int,
     ) -> None:
         handed_off = False
         temp_path: Path | None = None
@@ -75,7 +86,7 @@ class ReaderService(QObject):
                     wait_release_ms=wait_release_ms,
                     restore=self.config.clipboard_restore,
                 )
-                if self._stop.is_set():
+                if self._is_stale(generation):
                     return
                 raw_text = selection.text
                 method = selection.method
@@ -92,6 +103,8 @@ class ReaderService(QObject):
                 self.config.max_chars,
             )
             if not text:
+                if self._is_stale(generation):
+                    return
                 self.status.emit("没有检测到选中文本")
                 log_event(
                     "selection",
@@ -114,14 +127,21 @@ class ReaderService(QObject):
                 self.config.rate,
                 temp_path,
             )
-            if self._stop.is_set():
+            if self._is_stale(generation):
                 return
 
             self.status.emit("开始朗读")
-            self._player.play(
-                temp_path,
-                on_done=lambda ok, err: self._on_done(temp_path, ok, err),
-            )
+            # Check and hand off under the same lock used by _start, so a newer
+            # request cannot slip in between the staleness check and playback.
+            with self._lock:
+                if generation != self._request_id:
+                    return
+                self._player.play(
+                    temp_path,
+                    on_done=lambda ok, err: self._on_done(
+                        temp_path, ok, err, generation
+                    ),
+                )
             handed_off = True
 
             log_event(
@@ -139,6 +159,8 @@ class ReaderService(QObject):
             )
         except Exception as exc:
             log.exception("朗读失败")
+            if self._is_stale(generation):
+                return
             log_event(
                 "read",
                 ok=False,
@@ -148,20 +170,25 @@ class ReaderService(QObject):
             self.error.emit(f"朗读失败：{exc}")
             self.status.emit("朗读失败")
         finally:
-            if not handed_off:
-                if temp_path is not None:
-                    try:
-                        temp_path.unlink(missing_ok=True)
-                    except Exception:
-                        pass
-                self._busy.release()
+            if not handed_off and temp_path is not None:
+                try:
+                    temp_path.unlink(missing_ok=True)
+                except Exception:
+                    pass
 
-    def _on_done(self, temp_path: Path, ok: bool, error: Exception | None) -> None:
+    def _on_done(
+        self,
+        temp_path: Path,
+        ok: bool,
+        error: Exception | None,
+        generation: int,
+    ) -> None:
         try:
             temp_path.unlink(missing_ok=True)
         except Exception:
             pass
+        if self._is_stale(generation):
+            return
         if error is not None:
             self.error.emit(f"播放失败：{error}")
         self.status.emit("朗读完成" if ok else "已停止")
-        self._busy.release()

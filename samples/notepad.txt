@@ -1,0 +1,7 @@
+划词朗读测试 · 记事本
+
+第一段：这是记事本里的一段中文，用来验证拖选、双击选词和 Shift 点选都能正常读出。
+
+第二段：Selection TTS should also read English sentences, numbers 12345 and punctuation marks correctly.
+
+第三段：短句测试。选中它，点击浮窗里的「朗读」按钮，或者按 Ctrl+Alt+R。
