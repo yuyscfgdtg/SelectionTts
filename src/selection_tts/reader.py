@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import logging
 import threading
-import time
 from pathlib import Path
 from uuid import uuid4
 
@@ -37,13 +36,20 @@ class ReaderService(QObject):
         return self._busy.locked()
 
     def read_selection(self, wait_release_ms: int = 250) -> None:
+        self._start(wait_release_ms=wait_release_ms, preloaded_text=None, source="clipboard")
+
+    def read_text(self, text: str) -> None:
+        """Read text already captured by the selection popup."""
+        self._start(wait_release_ms=0, preloaded_text=text, source="popup")
+
+    def _start(self, wait_release_ms: int, preloaded_text: str | None, source: str) -> None:
         if not self._busy.acquire(blocking=False):
             self.status.emit("正在朗读中，请先停止")
             return
         self._stop.clear()
         self._thread = threading.Thread(
             target=self._worker,
-            args=(wait_release_ms,),
+            args=(wait_release_ms, preloaded_text, source),
             daemon=True,
             name="reader",
         )
@@ -53,20 +59,35 @@ class ReaderService(QObject):
         self._stop.set()
         self._player.stop()
 
-    def _worker(self, wait_release_ms: int) -> None:
+    def _worker(
+        self,
+        wait_release_ms: int,
+        preloaded_text: str | None,
+        source: str,
+    ) -> None:
         handed_off = False
         temp_path: Path | None = None
         try:
-            self.status.emit("正在读取选中文本…")
-            selection = read_selection_via_clipboard(
-                wait_release_ms=wait_release_ms,
-                restore=self.config.clipboard_restore,
-            )
-            if self._stop.is_set():
-                return
+            if preloaded_text is None:
+                self.status.emit("正在读取选中文本…")
+                selection = read_selection_via_clipboard(
+                    wait_release_ms=wait_release_ms,
+                    restore=self.config.clipboard_restore,
+                )
+                if self._stop.is_set():
+                    return
+                raw_text = selection.text
+                method = selection.method
+                selection_ms = selection.elapsed_ms
+                clipboard_restored = selection.clipboard_restored
+            else:
+                raw_text = preloaded_text
+                method = source
+                selection_ms = 0
+                clipboard_restored = None
 
             text, truncated = truncate_text(
-                normalize_text(selection.text),
+                normalize_text(raw_text),
                 self.config.max_chars,
             )
             if not text:
@@ -74,9 +95,9 @@ class ReaderService(QObject):
                 log_event(
                     "selection",
                     ok=False,
-                    method=selection.method,
+                    method=method,
                     chars=0,
-                    selection_ms=selection.elapsed_ms,
+                    selection_ms=selection_ms,
                 )
                 return
 
@@ -105,13 +126,13 @@ class ReaderService(QObject):
             log_event(
                 "read",
                 ok=True,
-                method=selection.method,
+                method=method,
                 chars=len(text),
                 truncated=truncated,
-                selection_ms=selection.elapsed_ms,
+                selection_ms=selection_ms,
                 synthesis_ms=synthesis.elapsed_ms,
                 attempts=synthesis.attempts,
-                clipboard_restored=selection.clipboard_restored,
+                clipboard_restored=clipboard_restored,
                 voice=self.config.voice,
                 rate=self.config.rate,
             )

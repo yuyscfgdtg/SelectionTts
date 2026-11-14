@@ -19,7 +19,9 @@ from .config import RATES, VOICES, AppConfig, load_config, save_config
 from .hotkeys import HotkeyManager
 from .logging_setup import setup_logging
 from .paths import LOG_DIR, ensure_dirs
+from .popup import SelectionPopup
 from .reader import ReaderService
+from .selection_monitor import SelectionMonitor
 
 log = logging.getLogger(__name__)
 
@@ -55,6 +57,16 @@ class TrayApp(QObject):
         self.hotkeys.toggle_requested.connect(self.toggle_auto_popup)
         self.hotkeys.registration_failed.connect(self._on_hotkey_failure)
         self.hotkeys.start(self.config.hotkey_read, self.config.hotkey_toggle)
+
+        self.popup = SelectionPopup(self.config)
+        self.popup.read_requested.connect(self.reader.read_text)
+        self.popup.shown.connect(self._on_popup_shown)
+        self.popup.hidden.connect(self._on_popup_hidden)
+
+        self.monitor = SelectionMonitor(self.config)
+        self.monitor.selection_ready.connect(self._on_selection_ready)
+        self.monitor.selection_cleared.connect(self.popup.hide)
+        self.monitor.set_enabled(self.config.auto_popup)
 
         self.tray.show()
         QTimer.singleShot(1200, self._show_ready_message)
@@ -136,6 +148,15 @@ class TrayApp(QObject):
     def _on_hotkey_read(self) -> None:
         self.reader.read_selection(wait_release_ms=250)
 
+    def _on_selection_ready(self, text: str, x: int, y: int) -> None:
+        self.popup.show_for(text, x, y)
+
+    def _on_popup_shown(self, rect: object) -> None:
+        self.monitor.set_popup_rect(rect)  # type: ignore[arg-type]
+
+    def _on_popup_hidden(self) -> None:
+        self.monitor.set_popup_rect(None)
+
     def _on_status(self, message: str) -> None:
         log.info("status: %s", message)
         self.tray.setToolTip(f"划词朗读\n{message}" if message else "划词朗读")
@@ -175,11 +196,14 @@ class TrayApp(QObject):
     def toggle_auto_popup(self) -> None:
         self.config.auto_popup = not self.config.auto_popup
         self.auto_action.setChecked(self.config.auto_popup)
+        self.monitor.set_enabled(self.config.auto_popup)
+        if not self.config.auto_popup:
+            self.popup.hide()
         save_config(self.config)
         state = "开启" if self.config.auto_popup else "关闭"
         self.tray.showMessage(
             "划词朗读",
-            f"自动弹窗已{state}（Phase 0 仅记录状态，D3 接入鼠标监听）",
+            f"自动弹窗已{state}（快捷键朗读始终可用）",
             QSystemTrayIcon.MessageIcon.Information,
             2200,
         )
@@ -209,12 +233,14 @@ class TrayApp(QObject):
     def _show_ready_message(self) -> None:
         self.tray.showMessage(
             "划词朗读已启动",
-            "选中文本后按 Ctrl+Alt+R 朗读\nCtrl+Alt+Shift+P 切换自动弹窗",
+            "划选文本会自动弹出朗读按钮\nCtrl+Alt+R 朗读当前选区\nCtrl+Alt+Shift+P 切换自动弹窗",
             QSystemTrayIcon.MessageIcon.Information,
             3000,
         )
 
     def quit(self) -> None:
+        self.monitor.stop()
+        self.popup.hide()
         self.hotkeys.stop()
         self.reader.stop()
         self.tray.hide()
