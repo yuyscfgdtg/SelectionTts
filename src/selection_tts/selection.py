@@ -14,6 +14,7 @@ from .clipboard import (
     snapshot_clipboard,
 )
 from .foreground import get_foreground_info
+from .uia import get_selected_text
 
 log = logging.getLogger(__name__)
 
@@ -44,6 +45,43 @@ def _send_copy() -> None:
     with controller.pressed(Key.ctrl):
         controller.press("c")
         controller.release("c")
+
+
+def read_selection(
+    prefer_uia: bool = True,
+    wait_release_ms: int = 220,
+    timeout_ms: int = 1200,
+    restore: bool = True,
+    uia_timeout: float = 1.0,
+) -> SelectionResult:
+    """Read the foreground selection, preferring UIA over clipboard copying.
+
+    UIA needs no clipboard access and works in terminal windows, but many
+    apps (most browsers without accessibility enabled, Qt, Tk, games) do not
+    expose TextPattern. When UIA yields nothing, fall back to Ctrl+C.
+    """
+    if prefer_uia:
+        started = time.perf_counter()
+        text, status = get_selected_text(uia_timeout)
+        if text:
+            return SelectionResult(
+                text=text,
+                method="uia",
+                elapsed_ms=int((time.perf_counter() - started) * 1000),
+            )
+        if status in {"self", "password"}:
+            log.info("UIA 状态为 %s，跳过剪贴板兜底", status)
+            return SelectionResult(
+                text="",
+                method="uia",
+                elapsed_ms=int((time.perf_counter() - started) * 1000),
+            )
+
+    return read_selection_via_clipboard(
+        wait_release_ms=wait_release_ms,
+        timeout_ms=timeout_ms,
+        restore=restore,
+    )
 
 
 def read_selection_via_clipboard(

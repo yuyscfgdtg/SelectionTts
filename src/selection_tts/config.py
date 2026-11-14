@@ -33,6 +33,7 @@ class AppConfig:
     hotkey_toggle: str = "<ctrl>+<alt>+shift+p"
     max_chars: int = 5000
     clipboard_restore: bool = True
+    use_uia: bool = True
     popup_delay_ms: int = 120
     popup_timeout_ms: int = 4000
     min_selection_chars: int = 1
@@ -50,6 +51,7 @@ def _sanitize(config: AppConfig) -> AppConfig:
         log.warning("未知语速 %s，回退到默认语速", config.rate)
         config.rate = AppConfig.rate
     config.max_chars = max(100, min(int(config.max_chars), 50_000))
+    config.use_uia = bool(config.use_uia)
     config.popup_delay_ms = max(0, min(int(config.popup_delay_ms), 2_000))
     config.popup_timeout_ms = max(500, min(int(config.popup_timeout_ms), 20_000))
     config.min_selection_chars = max(1, min(int(config.min_selection_chars), 100))

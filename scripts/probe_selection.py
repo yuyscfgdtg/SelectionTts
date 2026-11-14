@@ -1,94 +1,97 @@
-"""D2 probe: verify Ctrl+C selection capture and clipboard restore with Tk.
+"""D4 probe: UIA fails on Tk, so clipboard fallback must still work.
 
-The Tk event loop must stay alive while Ctrl+C is synthesized, otherwise Tk
-never processes the key event. This is why the read runs in a worker thread.
+Launches scripts/tk_target.py in a separate process (a Tk window has no UIA
+TextPattern), activates it, then reads the selection.
+
+Usage: uv run python scripts/probe_selection.py
 """
 
 from __future__ import annotations
 
-import threading
+import ctypes
+import os
+import subprocess
+import sys
 import time
-import tkinter as tk
+from ctypes import wintypes
+from pathlib import Path
 
 import pyperclip
 from pynput.mouse import Button, Controller
 
 from selection_tts.clipboard import read_clipboard_text
-from selection_tts.selection import SelectionResult, read_selection_via_clipboard
+from selection_tts.foreground import get_foreground_info
+from selection_tts.selection import read_selection
 
-SAMPLE = "这是一段用于验证划词复制的测试文本。"
+user32 = ctypes.windll.user32
+
+SAMPLE = "这是一段用于验证划词复制兜底的测试文本。"
+TARGET = Path(__file__).with_name("tk_target.py")
+
+
+def activate_from_title_bar(hwnd: int) -> None:
+    rect = wintypes.RECT()
+    user32.GetWindowRect(ctypes.c_void_p(hwnd), ctypes.byref(rect))
+    mouse = Controller()
+    old = mouse.position
+    mouse.position = ((rect.left + rect.right) // 2, rect.top + 10)
+    mouse.click(Button.left, 1)
+    time.sleep(0.25)
+    mouse.position = old
 
 
 def main() -> None:
+    sys.stdout.reconfigure(encoding="utf-8", errors="replace")
     pyperclip.copy("ORIGINAL_CLIPBOARD")
-
-    root = tk.Tk()
-    root.title("Selection TTS - clipboard probe")
-    root.geometry("560x180+240+240")
-    root.attributes("-topmost", True)
-
-    text = tk.Text(root, height=4, wrap="word")
-    text.pack(fill="both", expand=True, padx=8, pady=8)
-    text.insert("1.0", SAMPLE)
-    root.update()
-
-    # Bring the Tk window to the real foreground so the synthetic Ctrl+C is
-    # delivered here instead of to the terminal that launched the probe.
-    mouse = Controller()
-    old_position = mouse.position
-    mouse.position = (
-        text.winfo_rootx() + text.winfo_width() // 2,
-        text.winfo_rooty() + text.winfo_height() // 2,
-    )
-    mouse.click(Button.left, 1)
-    time.sleep(0.25)
-    mouse.position = old_position
-    root.update()
-
-    text.focus_force()
-    text.tag_add("sel", "1.0", "end-1c")
-    root.update()
-    time.sleep(0.25)
-
     before = read_clipboard_text()
-    holder: dict[str, SelectionResult] = {}
 
-    def worker() -> None:
-        holder["result"] = read_selection_via_clipboard(
-            wait_release_ms=0,
-            restore=True,
-        )
+    env = dict(os.environ)
+    env["SELECTION_TTS_SAMPLE"] = SAMPLE
+    process = subprocess.Popen(
+        [sys.executable, str(TARGET)],
+        stdout=subprocess.PIPE,
+        text=True,
+        encoding="utf-8",
+        env=env,
+    )
+    try:
+        line = process.stdout.readline().strip() if process.stdout else ""
+        if not line.isdigit():
+            raise SystemExit(f"FAIL: target window did not start ({line!r})")
+        hwnd = int(line)
 
-    def poll() -> None:
-        if "result" in holder:
-            finish()
-        else:
-            root.after(50, poll)
+        time.sleep(0.4)
+        activate_from_title_bar(hwnd)
+        print("foreground     :", get_foreground_info()[1:])
 
-    def finish() -> None:
-        result = holder["result"]
+        started = time.perf_counter()
+        result = read_selection(prefer_uia=True, wait_release_ms=0, restore=True)
+        elapsed = int((time.perf_counter() - started) * 1000)
         after = read_clipboard_text()
+
         print("selected        :", repr(result.text))
-        print("selected hex    :", result.text.encode("utf-8").hex())
-        print("sample hex      :", SAMPLE.encode("utf-8").hex())
-        print("lengths         :", len(result.text), len(SAMPLE))
         print("method          :", result.method)
-        print("selection_ms    :", result.elapsed_ms)
+        print("selection_ms    :", result.elapsed_ms, "(wall", elapsed, "ms)")
         print("restored        :", result.clipboard_restored)
         print("clipboard before:", repr(before))
         print("clipboard after :", repr(after))
-        print("clipboard equal :", after == before)
-        print("text equal      :", result.text.strip() == SAMPLE)
-        passed = result.text.strip() == SAMPLE and after == before
-        print("PASS" if passed else "FAIL")
-        root.destroy()
-        if not passed:
-            raise SystemExit(1)
 
-    threading.Thread(target=worker, daemon=True).start()
-    root.after(50, poll)
-    root.after(8000, lambda: (print("TIMEOUT"), root.destroy()))
-    root.mainloop()
+        checks = {
+            "text_matches": result.text.strip() == SAMPLE,
+            "method_clipboard": result.method == "clipboard",
+            "clipboard_restored": after == before,
+        }
+        for name, ok in checks.items():
+            print(f"  {name}: {'PASS' if ok else 'FAIL'}")
+        passed = all(checks.values())
+        print("PASS" if passed else "FAIL")
+        raise SystemExit(0 if passed else 1)
+    finally:
+        process.terminate()
+        try:
+            process.wait(timeout=5)
+        except Exception:
+            process.kill()
 
 
 if __name__ == "__main__":

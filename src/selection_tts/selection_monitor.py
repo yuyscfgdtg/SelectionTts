@@ -13,7 +13,7 @@ from .config import AppConfig
 from .foreground import get_foreground_info
 from .fullscreen import is_fullscreen_or_busy
 from .metrics import log_event
-from .selection import read_selection_via_clipboard
+from .selection import read_selection
 from .text_utils import normalize_text
 
 log = logging.getLogger(__name__)
@@ -178,7 +178,11 @@ class SelectionMonitor(QObject):
             if generation != self._generation or not self._enabled:
                 return
 
-            result = read_selection_via_clipboard(wait_release_ms=0, restore=True)
+            result = read_selection(
+                prefer_uia=self.config.use_uia,
+                wait_release_ms=0,
+                restore=True,
+            )
             if generation != self._generation or not self._enabled:
                 return
 

@@ -11,7 +11,7 @@ from .config import AppConfig
 from .metrics import log_event
 from .paths import CACHE_DIR, ensure_dirs
 from .player import AudioPlayer
-from .selection import read_selection_via_clipboard
+from .selection import read_selection
 from .text_utils import normalize_text, truncate_text
 from .tts import EdgeTtsEngine
 
@@ -70,7 +70,8 @@ class ReaderService(QObject):
         try:
             if preloaded_text is None:
                 self.status.emit("正在读取选中文本…")
-                selection = read_selection_via_clipboard(
+                selection = read_selection(
+                    prefer_uia=self.config.use_uia,
                     wait_release_ms=wait_release_ms,
                     restore=self.config.clipboard_restore,
                 )

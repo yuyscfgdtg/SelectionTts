@@ -185,6 +185,15 @@ wheels = [
 ]
 
 [[package]]
+name = "comtypes"
+version = "1.5.0"
+source = { registry = "https://pypi.org/simple" }
+sdist = { url = "https://files.pythonhosted.org/packages/21/cf/cd2f9e605c258d216ae48d86918ecff5bc652de338e090df3df4cd5d0d27/comtypes-1.5.0.tar.gz", hash = "sha256:831ddb867bc17bc89cac525b4f32132ebd4bef1ffe6432406ec9f5d858c1a122", size = 289180, upload-time = "2026-11-09T22:42:37.287Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/89/dc/818b43a6766800973e1611aeaff55e20cb38e36f3c499db1795838675f44/comtypes-1.5.0-py3-none-any.whl", hash = "sha256:c648ed3b243b1eb3b7cb893a873d1b35104ca1c8922061f4b1efafeb255bacb5", size = 325563, upload-time = "2026-11-09T22:42:35.97Z" },
+]
+
+[[package]]
 name = "edge-tts"
 version = "7.3.1"
 source = { registry = "https://pypi.org/simple" }
@@ -812,6 +821,7 @@ dependencies = [
     { name = "pyperclip" },
     { name = "pyside6" },
     { name = "pywin32" },
+    { name = "uiautomation" },
 ]
 
 [package.metadata]
@@ -822,6 +832,7 @@ requires-dist = [
     { name = "pyperclip", specifier = ">=1.11.0" },
     { name = "pyside6", specifier = ">=6.12.0" },
     { name = "pywin32", specifier = ">=312" },
+    { name = "uiautomation", specifier = ">=2.0.29" },
 ]
 
 [[package]]
@@ -861,6 +872,18 @@ source = { registry = "https://pypi.org/simple" }
 sdist = { url = "https://files.pythonhosted.org/packages/f6/cc/6253133b5bb138fc3306cebfbda2c520f545d36b5be2c7255cc528bb45d6/typing_extensions-4.16.0.tar.gz", hash = "sha256:dc983d19a509c94dba722ee6abd33940f7c05a89e243c47e907eb4db6f1a43e5", size = 113555, upload-time = "2026-07-02T08:40:05.92Z" }
 wheels = [
     { url = "https://files.pythonhosted.org/packages/49/d3/b8441a820a491ddfc024b0b0cf0393375b75ea13866d9c66727e54c2fc80/typing_extensions-4.16.0-py3-none-any.whl", hash = "sha256:481caa481374e813c1b176ada14e97f1f67a4539ce9cfeb3f350d78d6370c2e8", size = 45571, upload-time = "2026-07-02T08:40:04.659Z" },
+]
+
+[[package]]
+name = "uiautomation"
+version = "2.0.29"
+source = { registry = "https://pypi.org/simple" }
+dependencies = [
+    { name = "comtypes" },
+]
+sdist = { url = "https://files.pythonhosted.org/packages/bc/23/8238b5cb73e54c3618ce4d443c1830a2749264a0d61a9b61637096b8dc7a/uiautomation-2.0.29.tar.gz", hash = "sha256:3c169112043ce21065aead1d79c3baebdafc9cf03bd24ded02b2db11d423d88d", size = 203970, upload-time = "2025-08-05T05:14:41.194Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/b0/27/b9c4b33b4129805fa2c437fa13da06c71e74213ae46da098d194d89834fe/uiautomation-2.0.29-py3-none-any.whl", hash = "sha256:5dd51c9e77e70470142a13d903be67f256c445e7cf20b47ada0ece2bdaff9f32", size = 198985, upload-time = "2025-08-05T05:14:39.552Z" },
 ]
 
 [[package]]
