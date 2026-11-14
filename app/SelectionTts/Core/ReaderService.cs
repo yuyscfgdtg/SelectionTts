@@ -66,6 +66,9 @@ public sealed class ReaderService : IDisposable
         public double DurationSeconds;
         public long StartPcmBytes;
         public long PcmBytes;
+
+        /// <summary>这一句合成失败被跳过（缓存空音频，进度仍算它已处理）。</summary>
+        public bool Failed;
     }
 
     private readonly record struct WordSpan(int End, double StartSeconds);
@@ -94,6 +97,7 @@ public sealed class ReaderService : IDisposable
 
     private int _jumpTarget = -1;   // 合成器优先处理这一句
     private int _synthCursor;       // 顺序合成指针
+    private ReadStatus _lastRaised = ReadStatus.Idle;
 
     public ReaderService(AppSettings settings, ISpeechSynthesizer? engine = null)
     {
@@ -425,7 +429,11 @@ public sealed class ReaderService : IDisposable
                     total = _plan.Count;
                 }
 
-                var synthesized = await SynthesizeAsync(item.Segment.Text, token);
+                var synthesized = await SynthesizeWithRetryAsync(generation, index, total, item, token);
+                if (synthesized is null)
+                {
+                    continue;
+                }
 
                 lock (_gate)
                 {
@@ -434,16 +442,16 @@ public sealed class ReaderService : IDisposable
                         return;
                     }
 
-                    item.Words = BuildWordSpans(item.Segment.Text, synthesized.Boundaries);
-                    item.Mp3 = synthesized.Audio;
-                    item.DurationSeconds = synthesized.Audio.Length * 8d / 48_000d;
+                    item.Words = BuildWordSpans(item.Segment.Text, synthesized.Value.Boundaries);
+                    item.Mp3 = synthesized.Value.Audio;
+                    item.DurationSeconds = synthesized.Value.Audio.Length * 8d / 48_000d;
                 }
 
-                item.Ready.TrySetResult(synthesized.Audio);
+                item.Ready.TrySetResult(synthesized.Value.Audio);
 
                 Log.Info(
                     $"合成 {index + 1}/{total} 句 | {item.Segment.Length} 字 | " +
-                    $"{synthesized.ElapsedMs}ms | 音频≈{item.DurationSeconds:F2}s");
+                    $"{synthesized.Value.ElapsedMs}ms | 音频≈{item.DurationSeconds:F2}s");
             }
 
             Log.Info($"合成完成 | 全程 {watch.ElapsedMilliseconds}ms | 引擎={_engine.Name}");
@@ -499,6 +507,57 @@ public sealed class ReaderService : IDisposable
 
     private readonly record struct Synthesized(byte[] Audio, List<SpeechBoundary> Boundaries, int ElapsedMs);
 
+    /// <summary>
+    /// 合成一句，失败重试一次；再失败就跳过这一句（缓存空音频），不让整篇朗读跟着挂掉。
+    /// 返回 null 表示已跳过。
+    /// </summary>
+    private async Task<Synthesized?> SynthesizeWithRetryAsync(
+        int generation, int index, int total, SegmentRuntime item, CancellationToken token)
+    {
+        try
+        {
+            return await SynthesizeAsync(item.Segment.Text, token);
+        }
+        catch (OperationCanceledException)
+        {
+            throw;
+        }
+        catch (Exception ex)
+        {
+            Log.Warn($"第 {index + 1}/{total} 句合成失败，重试一次：{ex.Message}");
+        }
+
+        await Task.Delay(600, token);
+
+        try
+        {
+            return await SynthesizeAsync(item.Segment.Text, token);
+        }
+        catch (OperationCanceledException)
+        {
+            throw;
+        }
+        catch (Exception ex)
+        {
+            Log.Error($"第 {index + 1}/{total} 句合成失败，跳过这一句", ex);
+        }
+
+        lock (_gate)
+        {
+            if (generation != _generation)
+            {
+                return null;
+            }
+
+            item.Mp3 = [];
+            item.Failed = true;
+            item.DurationSeconds = 0;
+        }
+
+        item.Ready.TrySetResult([]);
+        return null;
+    }
+
     private async Task<Synthesized> SynthesizeAsync(string text, CancellationToken token)
     {
         using var audio = new MemoryStream();
@@ -544,6 +603,12 @@ public sealed class ReaderService : IDisposable
             _feederDone = false;
             _charIndex = plan[startIndex].Segment.Start;
             playerGeneration = _player.Begin();
+
+            // 用户可能在这几十毫秒的窗口里按了暂停：Begin 会把输出重新拉起来，这里补一次暂停
+            if (_status == ReadStatus.Paused)
+            {
+                _player.Pause();
+            }
         }
 
         var watch = Stopwatch.StartNew();
@@ -628,6 +693,12 @@ public sealed class ReaderService : IDisposable
             var item = _plan[i];
             if (item.PcmBytes <= 0)
             {
+                // 合成失败被跳过的句子没有音频，直接跳过继续找
+                if (item.Failed)
+                {
+                    continue;
+                }
+
                 break;
             }
 
@@ -720,8 +791,8 @@ public sealed class ReaderService : IDisposable
             return;
         }
 
-        Log.Info($"status: 朗读完成 | {detail}");
-        StatusChanged?.Invoke(ReadStatus.Completed);
+        Log.Info($"朗读结束 | {detail}");
+        RaiseStatus();
     }
 
     private void Fail(int generation, Exception ex)
@@ -819,8 +890,15 @@ public sealed class ReaderService : IDisposable
         lock (_gate)
         {
             status = _status;
+            if (status == _lastRaised)
+            {
+                return;
+            }
+
+            _lastRaised = status;
         }
 
+        Log.Info($"status: {Describe(status)}");
         StatusChanged?.Invoke(status);
     }
 

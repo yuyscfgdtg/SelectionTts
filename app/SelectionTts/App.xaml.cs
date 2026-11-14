@@ -105,7 +105,6 @@ public partial class App : System.Windows.Application
         _reader.StatusChanged += status => Dispatcher.Invoke(() =>
         {
             var state = _reader.GetState();
-            Log.Info($"status: {ReaderService.Describe(status)}");
             _tray.SetStatus(ReaderService.Describe(status));
 
             if (status == ReadStatus.Failed)

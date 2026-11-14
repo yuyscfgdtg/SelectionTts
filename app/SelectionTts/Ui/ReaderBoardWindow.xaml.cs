@@ -93,6 +93,8 @@ public partial class ReaderBoardWindow : Window
         Header.MouseMove += OnHeaderMouseMove;
         Header.MouseLeftButtonUp += OnHeaderMouseUp;
         PreviewMouseWheel += (_, _) => _lastUserScrollAt = Environment.TickCount64;
+        // 拖滑块 / 点轨道也算用户自己在滚，别让自动跟随马上把视图拽回去
+        Scroller.PreviewMouseDown += (_, _) => _lastUserScrollAt = Environment.TickCount64;
         Scroller.SizeChanged += (_, _) => ScheduleRelayout();
 
         _timer = new DispatcherTimer(DispatcherPriority.Background)
