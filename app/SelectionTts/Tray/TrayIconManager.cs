@@ -15,6 +15,8 @@ public sealed class TrayIconManager : IDisposable
     private readonly Dictionary<string, ToolStripMenuItem> _rateItems = [];
 
     public event Action? ExitRequested;
+    public event Action? ReadRequested;
+    public event Action? StopRequested;
 
     public TrayIconManager(AppSettings settings)
     {
@@ -25,7 +27,11 @@ public sealed class TrayIconManager : IDisposable
             Checked = settings.AutoPopup,
             CheckOnClick = false,
         };
-        _autoPopupItem.Click += (_, _) => ToggleAutoPopup();
+        _autoPopupItem.Click += (_, _) =>
+        {
+            Log.Info("托盘菜单：点击自动弹窗");
+            ToggleAutoPopup();
+        };
 
         _fullscreenItem = new ToolStripMenuItem("全屏/游戏时暂停自动弹窗")
         {
@@ -34,15 +40,17 @@ public sealed class TrayIconManager : IDisposable
         _fullscreenItem.Click += (_, _) => ToggleFullscreenPause();
 
         var menu = new ContextMenuStrip { ShowImageMargin = false };
-        menu.Items.Add(new ToolStripMenuItem("朗读当前选区    Ctrl+Alt+R", null, (_, _) => Notify("朗读功能开发中")));
+        menu.Items.Add(new ToolStripMenuItem("朗读当前选区    Ctrl+Alt+R", null, (_, _) => ReadRequested?.Invoke()));
         menu.Items.Add(_autoPopupItem);
         menu.Items.Add(_fullscreenItem);
-        menu.Items.Add(new ToolStripMenuItem("停止朗读", null, (_, _) => Notify("当前没有正在朗读的内容")));
+        menu.Items.Add(new ToolStripMenuItem("停止朗读", null, (_, _) => StopRequested?.Invoke()));
         menu.Items.Add(new ToolStripSeparator());
         menu.Items.Add(BuildVoiceMenu());
         menu.Items.Add(BuildRateMenu());
         menu.Items.Add(new ToolStripSeparator());
         menu.Items.Add(new ToolStripMenuItem("打开数据目录", null, (_, _) => OpenDataDir()));
+        menu.Items.Add(new ToolStripMenuItem("打开日志", null, (_, _) => OpenLog()));
+        menu.Items.Add(new ToolStripSeparator());
         menu.Items.Add(new ToolStripMenuItem("退出", null, (_, _) => ExitRequested?.Invoke()));
 
         _icon = new NotifyIcon
@@ -56,6 +64,13 @@ public sealed class TrayIconManager : IDisposable
 
     public void Notify(string message) =>
         _icon.ShowBalloonTip(2200, "划词朗读", message, ToolTipIcon.None);
+
+    /// <summary>托盘悬停提示，最多 63 个字符（Win32 限制）。</summary>
+    public void SetStatus(string status)
+    {
+        var text = "划词朗读 · " + status;
+        _icon.Text = text.Length <= 63 ? text : text[..63];
+    }
 
     public void ToggleAutoPopup()
     {
@@ -156,6 +171,22 @@ public sealed class TrayIconManager : IDisposable
         catch (Exception ex)
         {
             Log.Error("打开数据目录失败", ex);
+        }
+    }
+
+    private static void OpenLog()
+    {
+        try
+        {
+            var path = Path.Combine(AppPaths.LogDir, "app.log");
+            if (File.Exists(path))
+            {
+                Process.Start(new ProcessStartInfo { FileName = path, UseShellExecute = true });
+            }
+        }
+        catch (Exception ex)
+        {
+            Log.Error("打开日志失败", ex);
         }
     }
 
