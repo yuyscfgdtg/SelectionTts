@@ -40,6 +40,12 @@ public partial class App : System.Windows.Application
             return;
         }
 
+        if (e.Args.Contains("--selftest-stream"))
+        {
+            RunStreamSelfTest();
+            return;
+        }
+
         _instanceMutex = new Mutex(true, @"Local\SelectionTts.SingleInstance", out var createdNew);
         if (!createdNew)
         {
@@ -105,6 +111,76 @@ public partial class App : System.Windows.Application
             _settings.WatchEnabled = on;
             SettingsStore.Save(_settings);
             _tray.Notify(on ? "已开启监听：复制文本即朗读" : "已关闭监听");
+        }
+    }
+
+    /// <summary>
+    /// 验证流式合成：首包延迟、词时间戳条数、时间戳与音频时长是否吻合。
+    /// 结果写日志，控制台不输出（WinExe 没有控制台）。
+    /// </summary>
+    private async void RunStreamSelfTest()
+    {
+        try
+        {
+            var settings = SettingsStore.Load();
+            var client = new Tts.EdgeTtsClient();
+            var watch = System.Diagnostics.Stopwatch.StartNew();
+
+            var text =
+                "这是一段用于验证流式合成的测试文本。它的长度大约三百字，包含多个句子，" +
+                "用来确认服务端会为每一句话返回时间戳。第一句用来测首包延迟。" +
+                "第二句稍微长一点，中间有一个逗号，看看词边界的切分是否合理，" +
+                "以及 offset 是否随音频推进而递增。第三句继续，" +
+                "把文本撑到足够长，这样进度条才有东西可以显示。" +
+                "第四句用来确认时间戳不会在中途断掉。" +
+                "最后一句收尾，用来核对最后一个时间戳和音频总时长是否吻合。";
+
+            long firstAudioAt = -1;
+            long firstBoundaryAt = -1;
+            long audioBytes = 0;
+            var audioFrames = 0;
+            Tts.SpeechBoundary first = default;
+            Tts.SpeechBoundary last = default;
+
+            var summary = await client.StreamAsync(
+                text,
+                settings.Voice,
+                settings.Rate,
+                buffer =>
+                {
+                    Interlocked.CompareExchange(ref firstAudioAt, watch.ElapsedMilliseconds, -1);
+                    Interlocked.Add(ref audioBytes, buffer.Length);
+                    Interlocked.Increment(ref audioFrames);
+                },
+                boundary =>
+                {
+                    Interlocked.CompareExchange(ref firstBoundaryAt, watch.ElapsedMilliseconds, -1);
+                    if (first.Text is null)
+                    {
+                        first = boundary;
+                    }
+
+                    last = boundary;
+                },
+                CancellationToken.None);
+
+            Log.Info(
+                $"selftest stream | 字数={text.Length} | 首包={firstAudioAt}ms | " +
+                $"首时间戳={firstBoundaryAt}ms | 音频块={audioFrames} | 字节={audioBytes} | " +
+                $"估算时长={summary.DurationSeconds:F2}s | 时间戳={summary.BoundaryCount} | " +
+                $"耗时={summary.ElapsedMs}ms | 尝试={summary.Attempts}");
+            Log.Info(
+                $"selftest stream 首个边界 offset={first.OffsetSeconds:F3}s text=[{first.Text}] | " +
+                $"末个边界 offset={last.OffsetSeconds:F3}s text=[{last.Text}]");
+            Log.Info($"selftest stream done | 时间戳>0={summary.BoundaryCount > 0}");
+        }
+        catch (Exception ex)
+        {
+            Log.Error("selftest stream failed", ex);
+        }
+        finally
+        {
+            Shutdown(0);
         }
     }
 

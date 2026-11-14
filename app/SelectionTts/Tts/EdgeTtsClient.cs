@@ -1,7 +1,7 @@
 using System.Diagnostics;
 using System.Net.WebSockets;
-using System.Security.Cryptography;
 using System.Text;
+using System.Text.Json;
 using SelectionTts.Core;
 
 namespace SelectionTts.Tts;
@@ -10,9 +10,13 @@ public sealed record SynthesisResult(byte[] Audio, int ElapsedMs, int Attempts);
 
 /// <summary>
 /// 直接实现 Edge 朗读接口（与 Python 版 edge-tts 相同的 WebSocket 协议）。
-/// 只依赖音频流，不解析字幕事件。
+/// 音频边收边回调，同时解析 audio.metadata 里的词时间戳——进度条和剩余时间靠它，
+/// 不是靠猜。
+///
+/// 注意：服务端 sentenceBoundary 和 wordBoundary 同时开启时只会返回 WordBoundary，
+/// 所以这里只开 wordBoundary。
 /// </summary>
-public sealed class EdgeTtsClient
+public sealed class EdgeTtsClient : ISpeechSynthesizer
 {
     private const string OutputFormat = "audio-24khz-48kbitrate-mono-mp3";
 
@@ -21,10 +25,16 @@ public sealed class EdgeTtsClient
         $"(KHTML, like Gecko) Chrome/{DrmToken.ChromiumVersion.Split('.')[0]}.0.0.0 " +
         $"Safari/537.36 Edg/{DrmToken.ChromiumVersion.Split('.')[0]}.0.0.0";
 
-    public async Task<SynthesisResult> SynthesizeAsync(
+    /// <summary>
+    /// 流式合成。音频到达就回调，不攒到最后。
+    /// 只在"还没吐出任何音频"时重试——已经开始播了再重试会把同一句念两遍。
+    /// </summary>
+    public async Task<SynthesisSummary> StreamAsync(
         string text,
         string voice,
         string rate,
+        Action<ReadOnlyMemory<byte>> onAudio,
+        Action<SpeechBoundary>? onBoundary,
         CancellationToken cancellationToken)
     {
         var watch = Stopwatch.StartNew();
@@ -32,10 +42,26 @@ public sealed class EdgeTtsClient
 
         for (var attempt = 1; attempt <= 2; attempt++)
         {
+            var emitted = 0;
             try
             {
-                var audio = await SynthesizeOnceAsync(text, voice, rate, cancellationToken);
-                return new SynthesisResult(audio, (int)watch.ElapsedMilliseconds, attempt);
+                var summary = await StreamOnceAsync(
+                    text,
+                    voice,
+                    rate,
+                    buffer =>
+                    {
+                        Interlocked.Exchange(ref emitted, 1);
+                        onAudio(buffer);
+                    },
+                    onBoundary,
+                    cancellationToken);
+
+                return summary with
+                {
+                    ElapsedMs = (int)watch.ElapsedMilliseconds,
+                    Attempts = attempt,
+                };
             }
             catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
             {
@@ -44,17 +70,43 @@ public sealed class EdgeTtsClient
             catch (Exception ex)
             {
                 lastError = ex;
-                Log.Warn($"Edge TTS 第 {attempt} 次失败：{ex.GetType().Name}: {ex.Message}");
+                Log.Warn($"Edge TTS 流式第 {attempt} 次失败：{ex.GetType().Name}: {ex.Message}");
+
+                if (Volatile.Read(ref emitted) == 1)
+                {
+                    break;
+                }
             }
         }
 
         throw lastError ?? new InvalidOperationException("Edge TTS 合成失败");
     }
 
-    private static async Task<byte[]> SynthesizeOnceAsync(
+    /// <summary>兼容旧调用：收完再返回。只有自检在用，正式朗读走 StreamAsync。</summary>
+    public async Task<SynthesisResult> SynthesizeAsync(
         string text,
         string voice,
         string rate,
+        CancellationToken cancellationToken)
+    {
+        using var audio = new MemoryStream();
+        var summary = await StreamAsync(
+            text,
+            voice,
+            rate,
+            buffer => audio.Write(buffer.Span),
+            null,
+            cancellationToken);
+
+        return new SynthesisResult(audio.ToArray(), summary.ElapsedMs, summary.Attempts);
+    }
+
+    private static async Task<SynthesisSummary> StreamOnceAsync(
+        string text,
+        string voice,
+        string rate,
+        Action<ReadOnlyMemory<byte>> onAudio,
+        Action<SpeechBoundary>? onBoundary,
         CancellationToken cancellationToken)
     {
         var url =
@@ -79,8 +131,9 @@ public sealed class EdgeTtsClient
         await SendTextAsync(socket, BuildConfigMessage(), cancellationToken);
         await SendTextAsync(socket, BuildSsmlMessage(text, voice, rate), cancellationToken);
 
-        var audio = new MemoryStream();
         var buffer = new byte[32 * 1024];
+        var audioBytes = 0;
+        var boundaryCount = 0;
 
         while (socket.State == WebSocketState.Open && !cancellationToken.IsCancellationRequested)
         {
@@ -104,47 +157,139 @@ public sealed class EdgeTtsClient
                 break;
             }
 
+            if (message.Length == 0)
+            {
+                continue;
+            }
+
+            var payload = message.GetBuffer();
+
             if (result.MessageType == WebSocketMessageType.Text)
             {
-                var payload = Encoding.UTF8.GetString(message.ToArray());
-                if (payload.Contains("Path:turn.end", StringComparison.Ordinal))
+                var header = Encoding.UTF8.GetString(payload, 0, (int)message.Length);
+                if (header.Contains("Path:turn.end", StringComparison.Ordinal))
                 {
                     break;
                 }
 
-                // turn.start / audio.metadata 之类的文本帧不含音频，忽略
+                if (header.Contains("Path:audio.metadata", StringComparison.Ordinal))
+                {
+                    var split = header.IndexOf("\r\n\r\n", StringComparison.Ordinal);
+                    if (split >= 0)
+                    {
+                        boundaryCount += ParseMetadata(header[(split + 4)..], onBoundary);
+                    }
+                }
+
+                // turn.start / speech.config / 其它文本帧都不含音频
                 continue;
             }
 
             // 二进制帧：2 字节头长度（大端）+ 头文本 + 音频数据
-            var frame = message.ToArray();
-            if (frame.Length <= 2)
+            if (message.Length <= 2)
             {
                 continue;
             }
 
-            var headerLength = (frame[0] << 8) | frame[1];
+            var headerLength = (payload[0] << 8) | payload[1];
             var audioStart = 2 + headerLength;
-            if (audioStart >= frame.Length)
+            var frameLength = (int)message.Length;
+            if (audioStart >= frameLength)
             {
                 continue;
             }
 
-            var header = Encoding.ASCII.GetString(frame, 2, Math.Min(headerLength, frame.Length - 2));
-            if (!header.Contains("Path:audio", StringComparison.Ordinal))
+            var frameHeader = Encoding.ASCII.GetString(
+                payload, 2, Math.Min(headerLength, frameLength - 2));
+            if (!frameHeader.Contains("Path:audio", StringComparison.Ordinal))
             {
                 continue;
             }
 
-            audio.Write(frame, audioStart, frame.Length - audioStart);
+            var length = frameLength - audioStart;
+            audioBytes += length;
+            onAudio(new ReadOnlyMemory<byte>(payload, audioStart, length));
         }
 
-        if (audio.Length == 0)
+        if (audioBytes == 0)
         {
             throw new InvalidOperationException("Edge TTS 没有返回音频");
         }
 
-        return audio.ToArray();
+        return new SynthesisSummary(audioBytes, boundaryCount, 0, 1);
+    }
+
+    /// <summary>
+    /// 解析 audio.metadata 的正文：
+    /// {"Metadata":[{"Type":"WordBoundary","Data":{"Offset":1000000,"Duration":3375000,
+    ///  "text":{"Text":"第一","Length":2,"BoundaryType":"WordBoundary"}}}]}
+    /// </summary>
+    private static int ParseMetadata(string json, Action<SpeechBoundary>? onBoundary)
+    {
+        if (onBoundary is null)
+        {
+            return 0;
+        }
+
+        try
+        {
+            using var document = JsonDocument.Parse(json);
+            if (!document.RootElement.TryGetProperty("Metadata", out var items) ||
+                items.ValueKind != JsonValueKind.Array)
+            {
+                return 0;
+            }
+
+            var count = 0;
+            foreach (var item in items.EnumerateArray())
+            {
+                if (!item.TryGetProperty("Type", out var typeElement))
+                {
+                    continue;
+                }
+
+                var type = typeElement.GetString();
+                if (type is not ("WordBoundary" or "SentenceBoundary"))
+                {
+                    continue;
+                }
+
+                if (!item.TryGetProperty("Data", out var data))
+                {
+                    continue;
+                }
+
+                var offset = data.TryGetProperty("Offset", out var offsetElement) &&
+                             offsetElement.TryGetInt64(out var offsetValue)
+                    ? offsetValue
+                    : 0;
+
+                var duration = data.TryGetProperty("Duration", out var durationElement) &&
+                               durationElement.TryGetInt64(out var durationValue)
+                    ? durationValue
+                    : 0;
+
+                var text = "";
+                if (data.TryGetProperty("text", out var textElement) &&
+                    textElement.ValueKind == JsonValueKind.Object)
+                {
+                    if (textElement.TryGetProperty("Text", out var value))
+                    {
+                        text = value.GetString() ?? "";
+                    }
+                }
+
+                onBoundary(new SpeechBoundary(offset, duration, text));
+                count++;
+            }
+
+            return count;
+        }
+        catch (JsonException ex)
+        {
+            Log.Warn($"解析音频时间戳失败：{ex.Message}");
+            return 0;
+        }
     }
 
     private static Task SendTextAsync(ClientWebSocket socket, string payload, CancellationToken ct) =>
@@ -158,7 +303,7 @@ public sealed class EdgeTtsClient
     {
         var config =
             "{\"context\":{\"synthesis\":{\"audio\":{" +
-            "\"metadataoptions\":{\"sentenceBoundaryEnabled\":\"false\",\"wordBoundaryEnabled\":\"false\"}," +
+            "\"metadataoptions\":{\"sentenceBoundaryEnabled\":\"false\",\"wordBoundaryEnabled\":\"true\"}," +
             "\"outputFormat\":\"" + OutputFormat + "\"}}}}";
 
         return $"X-Timestamp:{Timestamp()}\r\n" +
