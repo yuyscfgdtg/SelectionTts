@@ -24,6 +24,7 @@ public sealed class TrayIconManager : IDisposable
 
     private bool _enabled;
     private string _status = "待命";
+    private long _lastTrayClickAt;
 
     public event Action? ExitRequested;
     public event Action? ToggleWatchRequested;
@@ -77,6 +78,26 @@ public sealed class TrayIconManager : IDisposable
             Visible = true,
         };
 
+        // 左键单击 = 显示/隐藏朗读板。双击会连发两次 MouseClick，
+        // 不节流就会"开了又关"，看起来像没反应。
+        _icon.MouseClick += (_, e) =>
+        {
+            if (e.Button != MouseButtons.Left)
+            {
+                return;
+            }
+
+            var now = Environment.TickCount64;
+            if (now - _lastTrayClickAt < 300)
+            {
+                return;
+            }
+
+            _lastTrayClickAt = now;
+            Log.Info("托盘左键：切换朗读板");
+            ToggleBoardRequested?.Invoke();
+        };
+
         UpdateEnabledText();
     }
 
@@ -103,12 +124,8 @@ public sealed class TrayIconManager : IDisposable
 
     public void SetHotkeyText(string text)
     {
-        if (string.IsNullOrWhiteSpace(text))
-        {
-            return;
-        }
-
-        _hotkeyText = text;
+        // 暂停/继续这类动作可以出厂不绑定，这里要能显示"未设置"
+        _hotkeyText = string.IsNullOrWhiteSpace(text) ? "未设置热键" : text;
         UpdateEnabledText();
     }
 

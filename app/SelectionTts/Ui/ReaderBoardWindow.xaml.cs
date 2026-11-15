@@ -30,8 +30,31 @@ public partial class ReaderBoardWindow : Window
     private const int WS_EX_NOACTIVATE = 0x08000000;
     private const int WS_EX_TOOLWINDOW = 0x00000080;
 
-    private const double BodyFontSize = 13.5;
-    private const double BodyLineHeight = 21;
+    /// <summary>420 宽时的基准字号与行高；实际值按窗口宽度等比缩放。</summary>
+    private const double BaseWidth = 420;
+
+    private const double BaseFontSize = 13.5;
+
+    private const double BaseLineHeight = 21;
+
+    private const double MinScale = 0.85;
+
+    private const double MaxScale = 2.15;
+
+    /// <summary>距窗口边缘多少 DIP 以内算拖拽缩放区域。</summary>
+    private const double ResizeBorder = 5;
+
+    private const int WM_NCHITTEST = 0x0084;
+
+    private const int HTCLIENT = 1;
+    private const int HTLEFT = 10;
+    private const int HTRIGHT = 11;
+    private const int HTTOP = 12;
+    private const int HTTOPLEFT = 13;
+    private const int HTTOPRIGHT = 14;
+    private const int HTBOTTOM = 15;
+    private const int HTBOTTOMLEFT = 16;
+    private const int HTBOTTOMRIGHT = 17;
 
     private static readonly Brush ActiveBackground =
         Freeze(new SolidColorBrush(Color.FromArgb(0x3A, 0x3D, 0xDC, 0x84)));
@@ -66,12 +89,18 @@ public partial class ReaderBoardWindow : Window
     private readonly ReaderService _reader;
     private readonly DispatcherTimer _timer;
     private readonly DispatcherTimer _resizeTimer;
+    private readonly DispatcherTimer _persistTimer;
     private readonly List<LineView> _lines = [];
 
+    private HwndSource? _hwndSource;
+    private double _bodyFontSize = BaseFontSize;
+    private double _bodyLineHeight = BaseLineHeight;
+    private double _renderedScale = 1;
     private string _renderedText = "";
     private double _renderedWidth;
     private int _activeLine = -1;
     private bool _enabled;
+    private string _hotkeyText = "Ctrl+Alt+R";
     private long _lastUserScrollAt;
     private Point _dragStartScreen;
     private Point _dragStartWindow;
@@ -83,10 +112,11 @@ public partial class ReaderBoardWindow : Window
         _reader = reader;
 
         InitializeComponent();
+        ApplyStoredSize();
         RestorePosition();
 
         CloseButton.Click += (_, _) => HideBoard();
-        PauseButton.Click += (_, _) => TogglePause();
+        PauseButton.Click += (_, _) => TogglePauseRequested?.Invoke();
         StopButton.Click += (_, _) => ToggleMaster?.Invoke();
 
         Header.MouseLeftButtonDown += OnHeaderMouseDown;
@@ -96,6 +126,7 @@ public partial class ReaderBoardWindow : Window
         // 拖滑块 / 点轨道也算用户自己在滚，别让自动跟随马上把视图拽回去
         Scroller.PreviewMouseDown += (_, _) => _lastUserScrollAt = Environment.TickCount64;
         Scroller.SizeChanged += (_, _) => ScheduleRelayout();
+        SizeChanged += OnWindowSizeChanged;
 
         _timer = new DispatcherTimer(DispatcherPriority.Background)
         {
@@ -114,10 +145,24 @@ public partial class ReaderBoardWindow : Window
             _resizeTimer.Stop();
             RelayoutIfNeeded();
         };
+
+        // 尺寸写回配置也防抖：拖拽过程中每帧都写盘既慢又没必要
+        _persistTimer = new DispatcherTimer(DispatcherPriority.Background)
+        {
+            Interval = TimeSpan.FromMilliseconds(500),
+        };
+        _persistTimer.Tick += (_, _) =>
+        {
+            _persistTimer.Stop();
+            PersistSizeIfChanged();
+        };
     }
 
     /// <summary>板子上的"停止/启动"就是软件总开关，由 App 接到 SetWatching。</summary>
     public event Action? ToggleMaster;
+
+    /// <summary>板子上的"暂停/继续"，和暂停热键共用 App 里的同一个入口。</summary>
+    public event Action? TogglePauseRequested;
 
     public void SetEnabled(bool enabled)
     {
@@ -128,21 +173,79 @@ public partial class ReaderBoardWindow : Window
     /// <summary>底部提示跟着当前热键走，改过热键之后不会显示旧组合。</summary>
     public void SetHotkeyText(string text)
     {
-        if (!string.IsNullOrWhiteSpace(text))
+        _hotkeyText = string.IsNullOrWhiteSpace(text) ? "" : text;
+        HintText.Text = _hotkeyText.Length == 0 ? "未设置热键" : $"{_hotkeyText} 开关";
+    }
+
+    /// <summary>
+    /// 设置里「恢复默认尺寸」保存后调用：按配置里的尺寸重设窗口，
+    /// 并把位置夹回可见区域（窄了之后可能超出屏幕边缘）。
+    /// </summary>
+    public void ApplySavedSize()
+    {
+        ApplyStoredSize();
+        ClampToVirtualScreen();
+    }
+
+    /// <summary>套用上次退出时的尺寸；上限跟着当前屏幕走，不写死在配置里。</summary>
+    private void ApplyStoredSize()
+    {
+        var area = SystemParameters.WorkArea;
+
+        var maxWidth = Math.Max(AppSettings.BoardMinWidth, Math.Min(AppSettings.BoardMaxWidth, area.Width));
+        var maxHeight = Math.Max(AppSettings.BoardMinHeight, area.Height);
+
+        MaxWidth = maxWidth;
+        MaxHeight = maxHeight;
+
+        Width = Math.Clamp(_settings.BoardWidth, AppSettings.BoardMinWidth, maxWidth);
+        Height = Math.Clamp(_settings.BoardHeight, AppSettings.BoardMinHeight, maxHeight);
+    }
+
+    /// <summary>字号比例：只跟宽度走，拖高只是多显示几行。</summary>
+    private double CurrentScale() =>
+        double.IsNaN(Width) || Width <= 0
+            ? 1
+            : Math.Clamp(Width / BaseWidth, MinScale, MaxScale);
+
+    private void OnWindowSizeChanged(object sender, SizeChangedEventArgs e)
+    {
+        // 只拖高度时不需要重新折行，但尺寸要照样记住
+        _persistTimer.Stop();
+        _persistTimer.Start();
+
+        if (e.WidthChanged)
         {
-            HintText.Text = $"{text} 开关";
+            ScheduleRelayout();
         }
+    }
+
+    private void PersistSizeIfChanged()
+    {
+        var width = (int)Math.Round(Width);
+        var height = (int)Math.Round(Height);
+
+        if (width == _settings.BoardWidth && height == _settings.BoardHeight)
+        {
+            return;
+        }
+
+        _settings.BoardWidth = width;
+        _settings.BoardHeight = height;
+        _ = SettingsStore.Save(_settings);
+        Log.Info($"朗读板尺寸：{width}×{height}");
     }
 
     public void ShowBoard()
     {
         if (!IsVisible)
         {
+            ClampToVirtualScreen();
             Show();
         }
 
         _settings.BoardVisible = true;
-        SettingsStore.Save(_settings);
+        _ = SettingsStore.Save(_settings);
         Render();
     }
 
@@ -164,7 +267,7 @@ public partial class ReaderBoardWindow : Window
     {
         Hide();
         _settings.BoardVisible = false;
-        SettingsStore.Save(_settings);
+        _ = SettingsStore.Save(_settings);
     }
 
     protected override void OnSourceInitialized(EventArgs e)
@@ -174,18 +277,64 @@ public partial class ReaderBoardWindow : Window
         var handle = new WindowInteropHelper(this).Handle;
         var style = GetWindowLong(handle, GWL_EXSTYLE);
         SetWindowLong(handle, GWL_EXSTYLE, style | WS_EX_NOACTIVATE | WS_EX_TOOLWINDOW);
+
+        // WindowStyle=None 的窗口没有系统边框，自己告诉系统哪几个像素是拖拽边
+        _hwndSource = HwndSource.FromHwnd(handle);
+        _hwndSource?.AddHook(WndProc);
     }
 
-    private void TogglePause()
+    protected override void OnClosed(EventArgs e)
     {
-        if (_reader.GetState().Status == ReadStatus.Paused)
+        _hwndSource?.RemoveHook(WndProc);
+        _hwndSource = null;
+        base.OnClosed(e);
+    }
+
+    /// <summary>
+    /// 把靠近边缘的鼠标位置翻译成系统的缩放命中码（HTLEFT/HTBOTTOMRIGHT…），
+    /// 之后由 Windows 自己完成拖拽缩放，光标形状和跟手程度都是原生的。
+    /// </summary>
+    private IntPtr WndProc(IntPtr hwnd, int msg, IntPtr wParam, IntPtr lParam, ref bool handled)
+    {
+        if (msg != WM_NCHITTEST)
         {
-            _reader.Resume();
+            return IntPtr.Zero;
         }
-        else
+
+        // lParam 低字是 x、高字是 y（屏幕坐标，多显示器可能是负数，所以要按 short 解）
+        var packed = lParam.ToInt64();
+        var screenX = unchecked((short)(packed & 0xFFFF));
+        var screenY = unchecked((short)((packed >> 16) & 0xFFFF));
+
+        var local = PointFromScreen(new Point(screenX, screenY));
+        var width = ActualWidth > 0 ? ActualWidth : Width;
+        var height = ActualHeight > 0 ? ActualHeight : Height;
+
+        var nearLeft = local.X <= ResizeBorder;
+        var nearRight = local.X >= width - ResizeBorder;
+        var nearTop = local.Y <= ResizeBorder;
+        var nearBottom = local.Y >= height - ResizeBorder;
+
+        var hit = (nearTop, nearBottom, nearLeft, nearRight) switch
         {
-            _reader.Pause();
+            (true, _, true, _) => HTTOPLEFT,
+            (true, _, _, true) => HTTOPRIGHT,
+            (_, true, true, _) => HTBOTTOMLEFT,
+            (_, true, _, true) => HTBOTTOMRIGHT,
+            (true, _, _, _) => HTTOP,
+            (_, true, _, _) => HTBOTTOM,
+            (_, _, true, _) => HTLEFT,
+            (_, _, _, true) => HTRIGHT,
+            _ => HTCLIENT,
+        };
+
+        if (hit == HTCLIENT)
+        {
+            return IntPtr.Zero;
         }
+
+        handled = true;
+        return new IntPtr(hit);
     }
 
     private void Render()
@@ -261,7 +410,9 @@ public partial class ReaderBoardWindow : Window
     private void RenderDisabled()
     {
         StatusText.Text = "已关闭";
-        MetaText.Text = "按 Ctrl+Alt+R 启用朗读";
+        MetaText.Text = _hotkeyText.Length == 0
+            ? "在托盘菜单启用朗读"
+            : $"按 {_hotkeyText} 启用朗读";
         StatusDot.Fill = DotIdle;
 
         PauseButton.IsEnabled = false;
@@ -294,8 +445,7 @@ public partial class ReaderBoardWindow : Window
             return;
         }
 
-        var width = AvailableWidth();
-        if (Math.Abs(width - _renderedWidth) < 2)
+        if (!NeedsRelayout())
         {
             return;
         }
@@ -311,12 +461,16 @@ public partial class ReaderBoardWindow : Window
             return;
         }
 
-        var width = AvailableWidth();
-        if (Math.Abs(width - _renderedWidth) >= 2)
+        if (NeedsRelayout())
         {
             RebuildLines(_renderedText);
         }
     }
+
+    /// <summary>宽度或字号比例变了都要重新折行。</summary>
+    private bool NeedsRelayout() =>
+        Math.Abs(AvailableWidth() - _renderedWidth) >= 2 ||
+        Math.Abs(CurrentScale() - _renderedScale) >= 0.01;
 
     private double AvailableWidth()
     {
@@ -343,23 +497,28 @@ public partial class ReaderBoardWindow : Window
     private void RebuildLines(string text)
     {
         var width = AvailableWidth();
+        var scale = CurrentScale();
+        _bodyFontSize = Math.Round(BaseFontSize * scale, 1);
+        _bodyLineHeight = Math.Round(BaseLineHeight * scale, 1);
+
         _renderedText = text;
         _renderedWidth = width;
+        _renderedScale = scale;
         _activeLine = -1;
         _lines.Clear();
         BlocksPanel.Children.Clear();
 
         var typeface = new Typeface(FontFamily, FontStyle, FontWeight, FontStretch);
         var dpi = VisualTreeHelper.GetDpi(this);
-        var layout = BoardTextLayout.Build(text, width, typeface, BodyFontSize, dpi.PixelsPerDip);
+        var layout = BoardTextLayout.Build(text, width, typeface, _bodyFontSize, dpi.PixelsPerDip);
 
         foreach (var line in layout)
         {
             var element = new TextBlock
             {
                 Text = line.Text.Length == 0 ? "\u00A0" : line.Text,
-                FontSize = BodyFontSize,
-                LineHeight = BodyLineHeight,
+                FontSize = _bodyFontSize,
+                LineHeight = _bodyLineHeight,
                 TextWrapping = TextWrapping.NoWrap,
                 Foreground = NormalForeground,
                 Background = Brushes.Transparent,
@@ -477,39 +636,54 @@ public partial class ReaderBoardWindow : Window
 
         _settings.BoardX = (int)Math.Round(Left);
         _settings.BoardY = (int)Math.Round(Top);
-        SettingsStore.Save(_settings);
+        _ = SettingsStore.Save(_settings);
     }
 
     private void RestorePosition()
     {
-        var left = _settings.BoardX;
-        var top = _settings.BoardY;
+        var area = SystemParameters.WorkArea;
 
-        if (IsOnScreen(left, top))
+        var hasSaved = _settings.BoardX != int.MinValue && _settings.BoardY != int.MinValue;
+        var left = hasSaved ? _settings.BoardX : area.Right - Width - 24;
+        var top = hasSaved ? _settings.BoardY : area.Bottom - Height - 24;
+
+        if (!IsOnScreen(left, top))
         {
-            Left = left;
-            Top = top;
-            return;
+            left = area.Right - Width - 24;
+            top = area.Bottom - Height - 24;
         }
 
-        var area = SystemParameters.WorkArea;
-        Left = area.Right - Width - 24;
-        Top = area.Bottom - Height - 24;
+        Left = left;
+        Top = top;
+
+        // 换到更小的屏幕、或分辨率变低之后，保证整块板子仍在桌面内
+        ClampToVirtualScreen();
     }
 
-    private static bool IsOnScreen(double left, double top)
+    /// <summary>把窗口夹回虚拟桌面范围（多屏时以整个虚拟桌面为准）。</summary>
+    private void ClampToVirtualScreen()
     {
-        if (left < 0 || top < 0)
-        {
-            return false;
-        }
-
         var virtualLeft = SystemParameters.VirtualScreenLeft;
         var virtualTop = SystemParameters.VirtualScreenTop;
         var virtualRight = virtualLeft + SystemParameters.VirtualScreenWidth;
         var virtualBottom = virtualTop + SystemParameters.VirtualScreenHeight;
 
-        // 至少要留出 80×80 在屏幕内，否则当作无效位置
+        var width = ActualWidth > 0 ? ActualWidth : Width;
+        var height = ActualHeight > 0 ? ActualHeight : Height;
+
+        Left = Math.Clamp(Left, virtualLeft, Math.Max(virtualLeft, virtualRight - width));
+        Top = Math.Clamp(Top, virtualTop, Math.Max(virtualTop, virtualBottom - height));
+    }
+
+    private static bool IsOnScreen(double left, double top)
+    {
+        var virtualLeft = SystemParameters.VirtualScreenLeft;
+        var virtualTop = SystemParameters.VirtualScreenTop;
+        var virtualRight = virtualLeft + SystemParameters.VirtualScreenWidth;
+        var virtualBottom = virtualTop + SystemParameters.VirtualScreenHeight;
+
+        // 至少要留出 80×80 在虚拟桌面内，否则当作无效位置。
+        // 注意不能把负坐标直接判无效：主屏左侧/上方的副屏就是负坐标。
         return left + 80 <= virtualRight && top + 80 <= virtualBottom &&
                left >= virtualLeft - 40 && top >= virtualTop - 40;
     }

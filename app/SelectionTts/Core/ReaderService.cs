@@ -73,12 +73,16 @@ public sealed class ReaderService : IDisposable
 
     private readonly record struct WordSpan(int End, double StartSeconds);
 
+    /// <summary>本次朗读的合成参数快照：朗读中途换音色/语速/引擎不影响正在读的这篇。</summary>
+    private sealed record ReadingOptions(string Voice, string Rate, ISpeechSynthesizer Engine);
+
     private readonly AppSettings _settings;
-    private readonly StreamingAudioPlayer _player = new();
+    private readonly IAudioPlayer _player;
     private readonly object _gate = new();
     private readonly System.Threading.Timer _timer;
 
     private ISpeechSynthesizer _engine;
+    private ReadingOptions? _options;
 
     private int _generation;          // 文本级：换文本就 +1
     private int _session;             // 播放级：每次 seek 就 +1
@@ -99,10 +103,11 @@ public sealed class ReaderService : IDisposable
     private int _synthCursor;       // 顺序合成指针
     private ReadStatus _lastRaised = ReadStatus.Idle;
 
-    public ReaderService(AppSettings settings, ISpeechSynthesizer? engine = null)
+    public ReaderService(AppSettings settings, ISpeechSynthesizer? engine = null, IAudioPlayer? player = null)
     {
         _settings = settings;
         _engine = engine ?? new EdgeTtsClient();
+        _player = player ?? new StreamingAudioPlayer();
         _timer = new System.Threading.Timer(_ => CheckCompletion(), null, 100, 100);
     }
 
@@ -347,6 +352,9 @@ public sealed class ReaderService : IDisposable
             _synthCursor = 0;
             _sessionStart = 0;
             _speakStartedAt = Environment.TickCount64;
+
+            // 快照本次朗读的合成参数：之后托盘换音色/语速、设置页换引擎都只影响下一篇
+            _options = new ReadingOptions(_settings.Voice, _settings.Rate, _engine);
         }
 
         _player.Stop();
@@ -371,7 +379,7 @@ public sealed class ReaderService : IDisposable
             return;
         }
 
-        Log.Info($"开始朗读 {text.Length} 字 | {plan.Count} 句 | 引擎={_engine.Name}");
+        Log.Info($"开始朗读 {text.Length} 字 | {plan.Count} 句 | 引擎={_options?.Engine.Name ?? _engine.Name}");
         RaiseStatus();
 
         _ = Task.Run(() => SynthesisLoopAsync(generation, token), token);
@@ -454,7 +462,7 @@ public sealed class ReaderService : IDisposable
                     $"{synthesized.Value.ElapsedMs}ms | 音频≈{item.DurationSeconds:F2}s");
             }
 
-            Log.Info($"合成完成 | 全程 {watch.ElapsedMilliseconds}ms | 引擎={_engine.Name}");
+            Log.Info($"合成完成 | 全程 {watch.ElapsedMilliseconds}ms | 引擎={_options?.Engine.Name ?? _engine.Name}");
         }
         catch (OperationCanceledException)
         {
@@ -560,13 +568,17 @@ public sealed class ReaderService : IDisposable
 
     private async Task<Synthesized> SynthesizeAsync(string text, CancellationToken token)
     {
+        // 用本次朗读开始时拍下的快照，而不是共享配置的当前值
+        var options = _options
+            ?? new ReadingOptions(_settings.Voice, _settings.Rate, _engine);
+
         using var audio = new MemoryStream();
         var boundaries = new List<SpeechBoundary>();
 
-        var summary = await _engine.StreamAsync(
+        var summary = await options.Engine.StreamAsync(
             text,
-            _settings.Voice,
-            _settings.Rate,
+            options.Voice,
+            options.Rate,
             buffer => audio.Write(buffer.Span),
             boundary => boundaries.Add(boundary),
             token);
@@ -577,46 +589,48 @@ public sealed class ReaderService : IDisposable
     /// <summary>播放会话：从第 startIndex 句开始，顺序取缓存喂给播放缓冲。</summary>
     private async Task PlaybackLoopAsync(int generation, int session, int startIndex, CancellationToken token)
     {
-        List<SegmentRuntime> plan;
-        int playerGeneration;
-
-        lock (_gate)
-        {
-            if (generation != _generation || session != _session)
-            {
-                return;
-            }
-
-            plan = _plan;
-            if (startIndex >= plan.Count)
-            {
-                return;
-            }
-
-            foreach (var item in plan)
-            {
-                item.StartPcmBytes = 0;
-                item.PcmBytes = 0;
-            }
-
-            _sessionStart = startIndex;
-            _feederDone = false;
-            _charIndex = plan[startIndex].Segment.Start;
-            playerGeneration = _player.Begin();
-
-            // 用户可能在这几十毫秒的窗口里按了暂停：Begin 会把输出重新拉起来，这里补一次暂停
-            if (_status == ReadStatus.Paused)
-            {
-                _player.Pause();
-            }
-        }
-
-        var watch = Stopwatch.StartNew();
-        long cursor = 0;
-        long firstAudioAt = -1;
+        List<SegmentRuntime> plan = [];
+        int playerSession = 0;
 
         try
         {
+            // 设备初始化也在异常边界内：没有音频设备、设备被独占时必须走到 Fail，
+            // 而不是让后台任务悄悄 fault、界面永远停在「正在合成」。
+            lock (_gate)
+            {
+                if (generation != _generation || session != _session)
+                {
+                    return;
+                }
+
+                plan = _plan;
+                if (startIndex >= plan.Count)
+                {
+                    return;
+                }
+
+                foreach (var item in plan)
+                {
+                    item.StartPcmBytes = 0;
+                    item.PcmBytes = 0;
+                }
+
+                _sessionStart = startIndex;
+                _feederDone = false;
+                _charIndex = plan[startIndex].Segment.Start;
+                playerSession = _player.Begin();
+
+                // 用户可能在这几十毫秒的窗口里按了暂停：Begin 会把输出重新拉起来，这里补一次暂停
+                if (_status == ReadStatus.Paused)
+                {
+                    _player.Pause();
+                }
+            }
+
+            var watch = Stopwatch.StartNew();
+            long cursor = 0;
+            long firstAudioAt = -1;
+
             for (var i = startIndex; i < plan.Count; i++)
             {
                 token.ThrowIfCancellationRequested();
@@ -627,8 +641,6 @@ public sealed class ReaderService : IDisposable
                     return;
                 }
 
-                var pcm = StreamingAudioPlayer.DecodeMp3(mp3);
-
                 lock (_gate)
                 {
                     if (generation != _generation || session != _session)
@@ -637,7 +649,6 @@ public sealed class ReaderService : IDisposable
                     }
 
                     plan[i].StartPcmBytes = cursor;
-                    plan[i].PcmBytes = pcm.Length;
 
                     if (firstAudioAt < 0 && _status == ReadStatus.Preparing)
                     {
@@ -652,11 +663,27 @@ public sealed class ReaderService : IDisposable
                     RaiseStatus();
                 }
 
-                cursor += pcm.Length;
-                await _player.WritePcmAsync(pcm, playerGeneration, token);
+                // 解码在播放器内部完成；会话已失效时它直接返回 0
+                var pcmBytes = await _player.WriteMp3Async(mp3, playerSession, token);
+                if (IsStale(generation, session))
+                {
+                    return;
+                }
+
+                lock (_gate)
+                {
+                    if (generation != _generation || session != _session)
+                    {
+                        return;
+                    }
+
+                    plan[i].PcmBytes = pcmBytes;
+                }
+
+                cursor += pcmBytes;
             }
 
-            _player.MarkFeederDone();
+            _player.MarkFeederDone(playerSession);
             lock (_gate)
             {
                 if (generation == _generation && session == _session)

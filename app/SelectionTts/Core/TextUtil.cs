@@ -41,6 +41,13 @@ public static partial class TextUtil
             return (text, false);
         }
 
-        return (text[..maxChars], true);
+        // 按 UTF-16 截断时不能把代理对切成半个字符（emoji、部分生僻字）
+        var cut = maxChars;
+        if (char.IsHighSurrogate(text[cut - 1]))
+        {
+            cut--;
+        }
+
+        return cut <= 0 ? ("", true) : (text[..cut], true);
     }
 }

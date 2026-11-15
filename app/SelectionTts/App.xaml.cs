@@ -17,6 +17,7 @@ public partial class App : System.Windows.Application
     private Ui.ReaderBoardWindow? _board;
     private AppSettings? _settings;
     private bool _watching;
+    private bool _ownsInstanceMutex;
 
     protected override void OnStartup(StartupEventArgs e)
     {
@@ -66,6 +67,12 @@ public partial class App : System.Windows.Application
             return;
         }
 
+        if (e.Args.Contains("--selftest-fault"))
+        {
+            RunFaultSelfTest();
+            return;
+        }
+
         _instanceMutex = new Mutex(true, @"Local\SelectionTts.SingleInstance", out var createdNew);
         if (!createdNew)
         {
@@ -73,6 +80,8 @@ public partial class App : System.Windows.Application
             Shutdown();
             return;
         }
+
+        _ownsInstanceMutex = true;
 
         Log.Info($"启动 SelectionTts {typeof(App).Assembly.GetName().Version} | 数据目录 {AppPaths.DataDir}");
 
@@ -95,12 +104,18 @@ public partial class App : System.Windows.Application
         // 板子上的"停止/启动"就是总开关，和热键同一个入口
         _board.ToggleMaster += () => SetWatching(!_watching, persist: true);
 
+        // 板子上的"暂停/继续"和暂停热键也共用一个入口
+        _board.TogglePauseRequested += TogglePause;
+
         _hotkeys.Pressed += actionId => Dispatcher.Invoke(() =>
         {
             switch (actionId)
             {
                 case "toggle-watch":
                     SetWatching(!_watching, persist: true);
+                    break;
+                case "toggle-pause":
+                    TogglePause();
                     break;
                 default:
                     Log.Warn($"未处理的热键动作 {actionId}");
@@ -174,23 +189,75 @@ public partial class App : System.Windows.Application
             if (!HotkeyGesture.TryParse(text, out var gesture) &&
                 !HotkeyGesture.TryParse(action.DefaultGesture, out gesture))
             {
-                Log.Warn($"热键 {action.Id} 的配置无效，已跳过");
+                // 配置里是空的（出厂不绑定）是正常情况，只有写坏了才值得警告
+                if (!string.IsNullOrWhiteSpace(text))
+                {
+                    Log.Warn($"热键 {action.Id} 的配置无效，已跳过：{text}");
+                }
+
                 continue;
             }
 
             desired.Add((action.Id, gesture));
         }
 
-        if (_hotkeys.TryApply(desired, out var error))
+        var ok = _hotkeys.TryApply(desired, out var error);
+
+        // 无论成败都刷新显示：成功的那几项可能已经换掉了
+        RefreshHotkeyTexts();
+
+        if (ok)
         {
-            var text = _hotkeys.Describe(HotkeyActions.ToggleWatch.Id);
-            _tray.SetHotkeyText(text);
-            _board?.SetHotkeyText(text);
             return;
         }
 
         Log.Warn($"热键注册失败：{error}");
-        _tray.Notify(error + "（旧热键仍然可用）");
+        _tray.Notify(error);
+    }
+
+    /// <summary>设置窗口保存路径：整批生效，失败由 HotkeyManager 回滚到原绑定。</summary>
+    private (bool Ok, string Error) ApplyHotkeySet(
+        IReadOnlyList<(string ActionId, HotkeyGesture Gesture)> desired)
+    {
+        if (_hotkeys is null)
+        {
+            return (false, "热键组件不可用");
+        }
+
+        var ok = _hotkeys.TryApplyExclusive(desired, out var error);
+        RefreshHotkeyTexts();
+        return (ok, error);
+    }
+
+    private void RefreshHotkeyTexts()
+    {
+        var watchText = _hotkeys?.Describe(HotkeyActions.ToggleWatch.Id) ?? "";
+        _tray?.SetHotkeyText(watchText);
+        _board?.SetHotkeyText(watchText);
+    }
+
+    /// <summary>暂停 / 继续。板子按钮和热键共用；空闲或读完时按了不做任何事。</summary>
+    private void TogglePause()
+    {
+        if (_reader is null)
+        {
+            return;
+        }
+
+        var status = _reader.GetState().Status;
+
+        if (status == ReadStatus.Paused)
+        {
+            _reader.Resume();
+        }
+        else if (status is ReadStatus.Playing or ReadStatus.Preparing)
+        {
+            _reader.Pause();
+        }
+        else
+        {
+            Log.Info($"暂停/继续：当前状态 {status}，忽略");
+        }
     }
 
     private void OpenSettings()
@@ -204,6 +271,8 @@ public partial class App : System.Windows.Application
         {
             SuspendHotkeys = () => _hotkeys.UnregisterAll(),
             ResumeHotkeys = ApplyHotkeys,
+            ApplyHotkeys = ApplyHotkeySet,
+            Cleanup = () => Maintenance.Clean(),
         };
 
         window.ShowDialog();
@@ -212,6 +281,9 @@ public partial class App : System.Windows.Application
         {
             return;
         }
+
+        // 设置里点了「恢复默认尺寸」并保存：让板子立刻回到默认大小
+        _board?.ApplySavedSize();
 
         _reader.SetEngine(CreateEngine());
         _tray.Notify("设置已保存");
@@ -238,7 +310,7 @@ public partial class App : System.Windows.Application
         if (persist && _settings is not null)
         {
             _settings.WatchEnabled = on;
-            SettingsStore.Save(_settings);
+            _ = SettingsStore.Save(_settings);
 
             // 板子看得见的时候它已经显示状态了，再弹气泡只会挡住板子
             if (_board is null || !_board.IsBoardVisible)
@@ -247,6 +319,9 @@ public partial class App : System.Windows.Application
             }
         }
     }
+
+    private static HotkeyGesture CtrlAlt(uint virtualKey) =>
+        new(HotkeyGesture.ModControl | HotkeyGesture.ModAlt, virtualKey);
 
     /// <summary>
     /// 验证流式合成：首包延迟、词时间戳条数、时间戳与音频时长是否吻合。
@@ -390,8 +465,7 @@ public partial class App : System.Windows.Application
     /// 验证配置相关能力：DPAPI 加解密、热键注册/换绑/冲突回滚。
     /// </summary>
     /// <summary>验证开机自启：开→关→复原，快捷方式随状态出现和消失。</summary>
-    private void RunAutoStartSelfTest()
-    {
+    private void RunAutoStartSelfTest()    {
         try
         {
             var initial = AutoStart.IsEnabled;
@@ -409,6 +483,26 @@ public partial class App : System.Windows.Application
         catch (Exception ex)
         {
             Log.Error("selftest autostart failed", ex);
+        }
+        finally
+        {
+            Shutdown(0);
+        }
+    }
+
+    /// <summary>
+    /// 故障注入自检：用假播放器 / 假合成器覆盖真实设备上难以稳定复现的路径。
+    /// 结果写日志；任何一项失败只记录，不抛出。
+    /// </summary>
+    private async void RunFaultSelfTest()
+    {
+        try
+        {
+            await Core.FaultSelfTest.RunAsync();
+        }
+        catch (Exception ex)
+        {
+            Log.Error("selftest fault failed", ex);
         }
         finally
         {
@@ -449,6 +543,30 @@ public partial class App : System.Windows.Application
 
             manager.Dispose();
 
+            // 运行中把两个动作的组合键互换（设置窗口保存就会走这条路径）：
+            // A 的新键被 B 的旧键占着、B 的新键被 A 的旧键占着，必须互相让位才能成功。
+            var swap = new HotkeyManager();
+            var swapBase = swap.TryApply(
+                [("toggle-watch", CtrlAlt(0x52)), ("toggle-pause", CtrlAlt(0x78))],
+                out _);
+            var swapOk = swap.TryApply(
+                [("toggle-watch", CtrlAlt(0x78)), ("toggle-pause", CtrlAlt(0x52))],
+                out var swapError);
+            Log.Info(
+                $"selftest hotkey 交换: 建立基础={swapBase} | 交换结果={swapOk} | 错误=[{swapError}] | " +
+                $"watch={swap.Describe("toggle-watch")} | pause={swap.Describe("toggle-pause")}");
+
+            // OEM 单字符键（KeyName 显示成 , - = . /）的解析往返：
+            // 录完保存没问题，重启后解析不回来就会静默丢成热键默认值。
+            foreach (var virtualKey in new uint[] { 0xBB, 0xBD, 0xBC, 0xBE, 0xBF })
+            {
+                var oem = new HotkeyGesture(HotkeyGesture.ModControl | HotkeyGesture.ModAlt, virtualKey);
+                var oemOk = HotkeyGesture.TryParse(oem.ToString(), out var back) && back == oem;
+                Log.Info($"selftest hotkey OEM 往返 {oem} = {oemOk}");
+            }
+
+            swap.Dispose();
+
             // 配置往返：验证"设置窗口保存 → 重启读取"这条链路（含 DPAPI 字段）
             var backup = File.Exists(AppPaths.ConfigPath)
                 ? File.ReadAllText(AppPaths.ConfigPath)
@@ -461,7 +579,7 @@ public partial class App : System.Windows.Application
                 probe.AzureRegion = "eastasia";
                 probe.AzureKeyProtected = Dpapi.Protect("test-key-123456");
                 probe.Hotkeys[HotkeyActions.ToggleWatch.Id] = "Ctrl+Shift+F9";
-                SettingsStore.Save(probe);
+                _ = SettingsStore.Save(probe);
 
                 var reloaded = SettingsStore.Load();
                 var key = Dpapi.Unprotect(reloaded.AzureKeyProtected);
@@ -522,7 +640,7 @@ public partial class App : System.Windows.Application
             var generation = player.Begin();
             await player.WritePcmAsync(
                 Audio.StreamingAudioPlayer.DecodeMp3(audio.Audio), generation, CancellationToken.None);
-            player.MarkFeederDone();
+            player.MarkFeederDone(generation);
 
             var waited = 0;
             while (!player.IsDrained && waited < 60000)
@@ -550,7 +668,19 @@ public partial class App : System.Windows.Application
         _board?.Close();
         _tray?.Dispose();
         Log.Info("退出");
-        _instanceMutex?.ReleaseMutex();
+
+        if (_ownsInstanceMutex)
+        {
+            try
+            {
+                _instanceMutex?.ReleaseMutex();
+            }
+            catch
+            {
+                // 只在自己的线程上持有时才会成功；退出路径不该再抛异常
+            }
+        }
+
         _instanceMutex?.Dispose();
         base.OnExit(e);
     }

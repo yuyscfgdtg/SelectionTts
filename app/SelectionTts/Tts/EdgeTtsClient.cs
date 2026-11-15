@@ -20,6 +20,12 @@ public sealed class EdgeTtsClient : ISpeechSynthesizer
 {
     private const string OutputFormat = "audio-24khz-48kbitrate-mono-mp3";
 
+    /// <summary>连接成功后单帧的最长等待：服务端卡住不能把整个合成循环挂死。</summary>
+    private static readonly TimeSpan IdleTimeout = TimeSpan.FromSeconds(15);
+
+    /// <summary>单条 WebSocket 消息的硬上限，防止异常帧把内存撑爆。</summary>
+    private const int MaxMessageBytes = 16 * 1024 * 1024;
+
     public string Name => "Edge";
 
     private static readonly string UserAgent =
@@ -143,11 +149,23 @@ public sealed class EdgeTtsClient : ISpeechSynthesizer
             WebSocketReceiveResult result;
             do
             {
-                result = await socket.ReceiveAsync(new ArraySegment<byte>(buffer), cancellationToken);
+                // 每帧都有空闲超时：连接建立后服务端不发数据时，这一句按失败处理，
+                // 由上层重试/跳过，而不是让合成循环永久等待。
+                result = await socket
+                    .ReceiveAsync(new ArraySegment<byte>(buffer), cancellationToken)
+                    .WaitAsync(IdleTimeout, cancellationToken)
+                    .ConfigureAwait(false);
+
                 if (result.MessageType == WebSocketMessageType.Close)
                 {
                     await socket.CloseOutputAsync(WebSocketCloseStatus.NormalClosure, null, CancellationToken.None);
                     break;
+                }
+
+                if (message.Length + result.Count > MaxMessageBytes)
+                {
+                    throw new InvalidOperationException(
+                        $"Edge 返回的消息超过 {MaxMessageBytes / (1024 * 1024)} MB，已断开");
                 }
 
                 message.Write(buffer, 0, result.Count);

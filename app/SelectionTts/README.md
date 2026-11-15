@@ -164,7 +164,7 @@ data\
 ## 安装（一键安装包）
 
 ```
-installer\output\SelectionTts-Setup-1.0.0.exe
+installer\output\SelectionTts-Setup-1.0.2.exe
 ```
 
 双击即可安装，**不需要管理员权限**，默认装到 `%LOCALAPPDATA%\Programs\SelectionTts`。

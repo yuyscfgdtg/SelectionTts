@@ -48,12 +48,41 @@
 
         <TextBlock Text="快捷键" FontSize="14" FontWeight="SemiBold"/>
         <StackPanel x:Name="HotkeyRows" Margin="0,8,0,0"/>
+        <TextBlock Margin="0,2,0,0" Foreground="#6B7280" TextWrapping="Wrap"
+                   Text="「暂停/继续朗读」出厂不绑定：点「录制」设定，「默认」清除绑定。"/>
+
+        <Separator Margin="0,16,0,14"/>
+
+        <TextBlock Text="朗读板" FontSize="14" FontWeight="SemiBold"/>
+        <Grid Margin="0,8,0,0">
+            <Grid.ColumnDefinitions>
+                <ColumnDefinition Width="Auto"/>
+                <ColumnDefinition Width="*"/>
+                <ColumnDefinition Width="Auto"/>
+            </Grid.ColumnDefinitions>
+
+            <TextBlock Grid.Column="0" x:Name="BoardSizeText" VerticalAlignment="Center"/>
+            <Button Grid.Column="2" x:Name="ResetBoardSizeButton" Content="恢复默认尺寸" Padding="12,4"/>
+        </Grid>
+        <TextBlock Margin="0,4,0,0" Foreground="#6B7280" TextWrapping="Wrap"
+                   Text="默认 420 × 320，最小 360 × 275，宽度最大 900；拖动板子边缘可调整。"/>
 
         <Separator Margin="0,16,0,14"/>
 
         <TextBlock Text="启动" FontSize="14" FontWeight="SemiBold"/>
         <CheckBox x:Name="AutoStartCheck" Margin="0,8,0,0"
                   Content="开机自动启动（登录后常驻托盘，不弹窗）"/>
+
+        <Separator Margin="0,16,0,14"/>
+
+        <TextBlock Text="维护" FontSize="14" FontWeight="SemiBold"/>
+        <StackPanel Orientation="Horizontal" Margin="0,8,0,0">
+            <Button x:Name="CleanupButton" Content="立即清理" Padding="12,4"/>
+            <TextBlock x:Name="CleanupResult" Margin="10,0,0,0" VerticalAlignment="Center"
+                       Foreground="#6B7280" TextWrapping="Wrap" MaxWidth="380"/>
+        </StackPanel>
+        <TextBlock Margin="0,4,0,0" Foreground="#6B7280" TextWrapping="Wrap"
+                   Text="清理临时文件与磁盘缓存，并把空闲内存还给系统；不影响当前朗读。"/>
 
         <Separator Margin="0,16,0,14"/>
 

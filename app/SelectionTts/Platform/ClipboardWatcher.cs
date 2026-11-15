@@ -22,6 +22,7 @@ public sealed class ClipboardWatcher : IDisposable
     private readonly System.Threading.Timer _timer;
     private readonly object _gate = new();
     private int _busy;
+    private int _pending;
     private string? _lastText;
     private long _lastAt;
 
@@ -67,7 +68,9 @@ public sealed class ClipboardWatcher : IDisposable
             return;
         }
 
-        // 重启定时器即完成合并：连续事件只会在最后一次之后 100ms 触发一次读取
+        // 记下"又有新内容"再重启定时器：连续事件只会在最后一次之后 100ms 触发一次读取。
+        // pending 的作用是防止读取较慢时，期间到达的新复制被丢掉。
+        Interlocked.Exchange(ref _pending, 1);
         _timer.Change(ReadDelayMs, Timeout.Infinite);
     }
 
@@ -78,10 +81,14 @@ public sealed class ClipboardWatcher : IDisposable
             return;
         }
 
+        // 已有读取在跑：pending 保留，等那一次收尾后自动补读
         if (Interlocked.Exchange(ref _busy, 1) == 1)
         {
             return;
         }
+
+        // 本次读取就是来处理 pending 的
+        Interlocked.Exchange(ref _pending, 0);
 
         try
         {
@@ -110,6 +117,12 @@ public sealed class ClipboardWatcher : IDisposable
         finally
         {
             Volatile.Write(ref _busy, 0);
+
+            // 读取期间又发生过复制：立刻补一次，最终只朗读最新内容
+            if (Interlocked.Exchange(ref _pending, 0) == 1 && Enabled)
+            {
+                _timer.Change(ReadDelayMs, Timeout.Infinite);
+            }
         }
     }
 

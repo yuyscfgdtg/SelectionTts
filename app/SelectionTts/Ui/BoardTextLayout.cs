@@ -113,6 +113,13 @@ public static class BoardTextLayout
             }
         }
 
+        // 不能把代理对（emoji 等）拆到两行
+        if (best > 1 && best < available &&
+            char.IsHighSurrogate(text[start + best - 1]) && char.IsLowSurrogate(text[start + best]))
+        {
+            best--;
+        }
+
         return Math.Max(1, best);
     }
 

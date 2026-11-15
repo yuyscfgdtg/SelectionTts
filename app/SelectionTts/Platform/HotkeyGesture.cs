@@ -104,6 +104,13 @@ public readonly record struct HotkeyGesture(uint Modifiers, uint VirtualKey)
     {
         gesture = default;
 
+        // 修饰键本身、以及 WPF 认不出来的键（Alt 单独按下会变成 NoName）
+        // 都不能当成组合键记录，否则会录出 Ctrl+NoName 这种无效绑定。
+        if (key is Key.None or Key.NoName or Key.System or Key.ImeProcessed or Key.DeadCharProcessed)
+        {
+            return false;
+        }
+
         var virtualKey = (uint)KeyInterop.VirtualKeyFromKey(key);
         if (virtualKey == 0)
         {
@@ -172,6 +179,18 @@ public readonly record struct HotkeyGesture(uint Modifiers, uint VirtualKey)
             {
                 return c;
             }
+
+            // KeyName 把这几个 OEM 键显示成单字符，保存后要能原样解析回来，
+            // 否则录 , . / - = 的热键一重启就丢。
+            return c switch
+            {
+                ',' => 0xBC, // VK_OEM_COMMA
+                '-' => 0xBD, // VK_OEM_MINUS
+                '=' => 0xBB, // VK_OEM_PLUS
+                '.' => 0xBE, // VK_OEM_PERIOD
+                '/' => 0xBF, // VK_OEM_2（问号斜杠）
+                _ => 0,
+            };
         }
 
         if (name.Length is 2 or 3 && (name[0] is 'F' or 'f') &&

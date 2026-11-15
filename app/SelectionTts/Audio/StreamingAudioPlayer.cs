@@ -9,8 +9,12 @@ namespace SelectionTts.Audio;
 ///
 /// 位置是真位置：已写入的 PCM 字节 - 还在缓冲里的字节 = 已经放出去的字节。
 /// 进度条和剩余时间都靠它，不靠估算。
+///
+/// 会话语义：每次 Begin 递增会话编号并清零计数。写入、计数、喂完标记
+/// 都在同一把锁内核对会话号——旧流水线跨过 seek 后写的字节必须被丢弃，
+/// 否则新会话的位置会跳变。
 /// </summary>
-public sealed class StreamingAudioPlayer : IDisposable
+public sealed class StreamingAudioPlayer : IAudioPlayer
 {
     public const int SampleRate = 24000;
     public const int Channels = 1;
@@ -19,7 +23,7 @@ public sealed class StreamingAudioPlayer : IDisposable
     private readonly object _gate = new();
     private WaveOutEvent? _output;
     private BufferedWaveProvider? _buffer;
-    private int _generation;
+    private int _session;
     private long _writtenBytes;
     private bool _feederDone;
 
@@ -37,20 +41,55 @@ public sealed class StreamingAudioPlayer : IDisposable
         };
 
         var output = new WaveOutEvent { DesiredLatency = 200 };
-        output.Init(buffer);
 
-        int generation;
-        lock (_gate)
+        try
         {
-            generation = ++_generation;
-            _buffer = buffer;
-            _output = output;
-            _writtenBytes = 0;
-            _feederDone = false;
-        }
+            output.Init(buffer);
 
-        output.Play();
-        return generation;
+            int session;
+            lock (_gate)
+            {
+                session = ++_session;
+                _buffer = buffer;
+                _output = output;
+                _writtenBytes = 0;
+                _feederDone = false;
+            }
+
+            output.Play();
+            return session;
+        }
+        catch
+        {
+            // Init / Play 失败：不能把半初始化的设备留在字段里，否则后续 Stop 会访问坏状态
+            lock (_gate)
+            {
+                if (ReferenceEquals(_output, output))
+                {
+                    _output = null;
+                    _buffer = null;
+                }
+            }
+
+            try
+            {
+                output.Dispose();
+            }
+            catch
+            {
+                // 设备自身已经坏了，释放失败也无计可施
+            }
+
+            throw;
+        }
+    }
+
+    /// <summary>把整段 MP3 解码后写进缓冲，返回 PCM 字节数。</summary>
+    public async Task<int> WriteMp3Async(byte[] mp3, int sessionId, CancellationToken cancellationToken)
+    {
+        var pcm = DecodeMp3(mp3);
+        await WritePcmAsync(pcm, sessionId, cancellationToken).ConfigureAwait(false);
+        return pcm.Length;
     }
 
     /// <summary>把整段 MP3 解码成 24kHz/16bit/单声道 PCM。</summary>
@@ -75,47 +114,52 @@ public sealed class StreamingAudioPlayer : IDisposable
         return pcm.ToArray();
     }
 
-    /// <summary>把 PCM 写进缓冲。缓冲满时等待播放消耗（背压，不丢音频）。</summary>
-    public async Task WritePcmAsync(byte[] pcm, int generation, CancellationToken cancellationToken)
+    /// <summary>
+    /// 把 PCM 写进缓冲。缓冲满时等待播放消耗（背压，不丢音频）。
+    /// 写入与计数在同一同步边界内完成；会话已切换则立即放弃。
+    /// </summary>
+    public async Task WritePcmAsync(byte[] pcm, int sessionId, CancellationToken cancellationToken)
     {
         var offset = 0;
+
         while (offset < pcm.Length)
         {
-            BufferedWaveProvider? buffer;
+            var wrote = false;
+
             lock (_gate)
             {
-                if (generation != _generation)
+                if (sessionId != _session || _buffer is null)
                 {
                     return;
                 }
 
-                buffer = _buffer;
+                var free = _buffer.BufferLength - _buffer.BufferedBytes;
+                if (free > 0)
+                {
+                    var count = Math.Min(free, pcm.Length - offset);
+                    _buffer.AddSamples(pcm, offset, count);
+                    _writtenBytes += count;
+                    offset += count;
+                    wrote = true;
+                }
             }
 
-            if (buffer is null)
-            {
-                return;
-            }
-
-            var free = buffer.BufferLength - buffer.BufferedBytes;
-            if (free <= 0)
+            if (!wrote)
             {
                 await Task.Delay(40, cancellationToken).ConfigureAwait(false);
-                continue;
             }
-
-            var count = Math.Min(free, pcm.Length - offset);
-            buffer.AddSamples(pcm, offset, count);
-            Interlocked.Add(ref _writtenBytes, count);
-            offset += count;
         }
     }
 
-    public void MarkFeederDone()
+    /// <summary>只有当前会话才能标记"喂完"；旧会话迟到的标记会被忽略。</summary>
+    public void MarkFeederDone(int sessionId)
     {
         lock (_gate)
         {
-            _feederDone = true;
+            if (sessionId == _session)
+            {
+                _feederDone = true;
+            }
         }
     }
 
@@ -123,7 +167,6 @@ public sealed class StreamingAudioPlayer : IDisposable
     {
         get
         {
-            var buffered = 0;
             lock (_gate)
             {
                 if (_buffer is null)
@@ -131,11 +174,9 @@ public sealed class StreamingAudioPlayer : IDisposable
                     return 0;
                 }
 
-                buffered = _buffer.BufferedBytes;
+                var played = Math.Max(0, _writtenBytes - _buffer.BufferedBytes);
+                return played / (double)BytesPerSecond;
             }
-
-            var played = Math.Max(0, Interlocked.Read(ref _writtenBytes) - buffered);
-            return played / (double)BytesPerSecond;
         }
     }
 
@@ -146,12 +187,7 @@ public sealed class StreamingAudioPlayer : IDisposable
         {
             lock (_gate)
             {
-                if (!_feederDone || _buffer is null)
-                {
-                    return false;
-                }
-
-                return _buffer.BufferedBytes == 0;
+                return _feederDone && _buffer is not null && _buffer.BufferedBytes == 0;
             }
         }
     }
@@ -187,7 +223,7 @@ public sealed class StreamingAudioPlayer : IDisposable
         WaveOutEvent? output;
         lock (_gate)
         {
-            _generation++;
+            _session++;
             _buffer = null;
             _feederDone = true;
             _writtenBytes = 0;

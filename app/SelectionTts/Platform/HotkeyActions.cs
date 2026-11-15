@@ -13,7 +13,11 @@ public static class HotkeyActions
     public static readonly HotkeyAction ToggleWatch =
         new("toggle-watch", "开启/关闭朗读", "Ctrl+Alt+R");
 
-    public static IReadOnlyList<HotkeyAction> All { get; } = [ToggleWatch];
+    /// <summary>出厂不绑定组合键：留空，由用户自己录。</summary>
+    public static readonly HotkeyAction TogglePause =
+        new("toggle-pause", "暂停/继续朗读", "");
+
+    public static IReadOnlyList<HotkeyAction> All { get; } = [ToggleWatch, TogglePause];
 
     public static string DefaultOf(string actionId) =>
         All.FirstOrDefault(action => action.Id == actionId)?.DefaultGesture ?? "";
