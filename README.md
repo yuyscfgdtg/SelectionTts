@@ -8,6 +8,8 @@ Windows 10/11 托盘小工具：**复制文本，自动朗读**，并在一个�
 > 遇到问题、觉得哪里别扭、想要什么功能，都欢迎到 [Issues](https://github.com/yuyscfgdtg/SelectionTts/issues) 说一声。
 > 反馈时附上 `data\logs\app.log` 里相关的几行最好（日志只记字数，不记录复制的内容）。
 
+> 📁 仓库只承载软件本体；完整工程采用「本体 / 正式快照 / 未发布存档 / 项目记忆 / 变更记录」五区结构，见 [PROJECT_LAYOUT.md](PROJECT_LAYOUT.md)。
+
 ![朗读板](docs/images/board.png)
 
 ## 特性
