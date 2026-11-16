@@ -23,6 +23,12 @@ public sealed class EdgeTtsClient : ISpeechSynthesizer
     /// <summary>连接成功后单帧的最长等待：服务端卡住不能把整个合成循环挂死。</summary>
     private static readonly TimeSpan IdleTimeout = TimeSpan.FromSeconds(15);
 
+    /// <summary>
+    /// 建立连接（DNS + TCP + TLS）的最长等待。
+    /// 网络抖动时尽快失败交给上层重试，而不是让整篇卡在「正在合成 0%」。
+    /// </summary>
+    private static readonly TimeSpan ConnectTimeout = TimeSpan.FromSeconds(4);
+
     /// <summary>单条 WebSocket 消息的硬上限，防止异常帧把内存撑爆。</summary>
     private const int MaxMessageBytes = 16 * 1024 * 1024;
 
@@ -133,7 +139,7 @@ public sealed class EdgeTtsClient : ISpeechSynthesizer
         socket.Options.SetRequestHeader("Cookie", $"muid={Guid.NewGuid():N};");
 
         using var connectTimeout = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
-        connectTimeout.CancelAfter(TimeSpan.FromSeconds(10));
+        connectTimeout.CancelAfter(ConnectTimeout);
         await socket.ConnectAsync(new Uri(url), connectTimeout.Token);
 
         await SendTextAsync(socket, BuildConfigMessage(), cancellationToken);
