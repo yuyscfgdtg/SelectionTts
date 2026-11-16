@@ -673,10 +673,12 @@ public sealed class ReaderService : IDisposable
                     // 单句失败已经重试并跳过，进度照样往前走；
                     // 但连着失败说明是网络/服务整体不可用，继续硬爬只会让进度条
                     // 一点点挪上十几分钟，不如停下来把原因说清楚。
-                    if (++consecutiveFailures >= 3)
+                    // 阈值取 2：单句失败最多已经吃掉 4 次建连（4 秒超时），
+                    // 再让第三句陪着超时，用户看到的就是"点了没反应"。
+                    if (++consecutiveFailures >= 2)
                     {
-                        Fail(synth, new InvalidOperationException(
-                            $"{_options?.Engine.Name ?? _engine.Name} 合成连续失败（网络或服务异常），已停止本篇朗读"));
+                        Log.Warn($"连续 {consecutiveFailures} 句合成失败，停止本篇朗读");
+                        Fail(synth, new InvalidOperationException("无法连接语音服务，请检查网络后重试"));
                         return;
                     }
 

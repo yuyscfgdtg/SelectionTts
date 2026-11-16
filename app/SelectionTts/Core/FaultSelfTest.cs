@@ -161,7 +161,10 @@ internal static class FaultSelfTest
             $"selftest fault 超时不算取消 | 状态={state?.Status} | 合成完整={state?.SynthesisDone} | 通过={ok}");
     }
 
-    /// <summary>连续 3 句失败要停下来报错，而不是让进度条一点点挪十几分钟。</summary>
+    /// <summary>
+    /// 连续 2 句失败要停下来报错，而不是让进度条一点点挪十几分钟。
+    /// 提示必须能让用户动手处理（检查网络），而不是只写"合成失败"。
+    /// </summary>
     private static async Task ConsecutiveFailureStopsAsync()
     {
         var settings = new AppSettings();
@@ -176,7 +179,7 @@ internal static class FaultSelfTest
         var state = await WaitForAsync(
             reader, s => s is ReadStatus.Failed or ReadStatus.Completed, 15000);
         var ok = state is { Status: ReadStatus.Failed } &&
-                 state.Error?.Contains("连续失败") == true;
+                 state.Error?.Contains("请检查网络") == true;
         Log.Info(
             $"selftest fault 连续失败停止 | 状态={state?.Status} | 提示=[{state?.Error}] | 通过={ok}");
     }
