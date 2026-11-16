@@ -5,7 +5,7 @@
 ## 开发
 
 ```powershell
-cd D:\桌面\TTS\app\SelectionTts
+cd D:\桌面\SelectionTts_beta\SelectionTts_ProjectCatalog\ontology_file\app\SelectionTts
 dotnet build -c Debug
 dotnet run
 ```
@@ -13,7 +13,7 @@ dotnet run
 ## 发布便携版（单文件、自包含）
 
 ```powershell
-cd D:\桌面\TTS
+cd D:\桌面\SelectionTts_beta\SelectionTts_ProjectCatalog\ontology_file
 dotnet publish app\SelectionTts\SelectionTts.csproj -c Release -r win-x64 `
   --self-contained true `
   -p:PublishSingleFile=true `
