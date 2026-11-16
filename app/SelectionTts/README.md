@@ -164,7 +164,7 @@ data\
 ## 安装（一键安装包）
 
 ```
-installer\output\SelectionTts-Setup-1.0.2.exe
+installer\output\SelectionTts-Setup-1.0.3.exe
 ```
 
 双击即可安装，**不需要管理员权限**，默认装到 `%LOCALAPPDATA%\Programs\SelectionTts`。
@@ -207,3 +207,4 @@ dotnet publish -c Release -r win-x64 --self-contained true -p:PublishSingleFile=
 - 合成单位是「一句话」：这样点行才能精确到句、已合成的不重做；代价是请求数比整段合成多（5000 字约 100+ 次请求），首次填满缓存大约需要一分钟——播放本身要十几分钟，所以始终跑在播放前面
 - Azure 免费层有每分钟请求数限制，撞到 429 会自动等待并重试，表现为进度条暂时停住
 - 单次最长 5000 字，超出部分截断
+

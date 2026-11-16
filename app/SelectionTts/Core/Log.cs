@@ -1,5 +1,7 @@
 namespace SelectionTts.Core;
 
+using System.Text;
+
 public static class Log
 {
     private static readonly object Gate = new();
@@ -26,16 +28,32 @@ public static class Log
             return;
         }
 
-        var line = $"{DateTime.Now:yyyy-MM-dd HH:mm:ss.fff} {level} {message}";
+        var line = $"{DateTime.Now:yyyy-MM-dd HH:mm:ss.fff} {level} {message}" + Environment.NewLine;
+        var bytes = Encoding.UTF8.GetBytes(line);
+
         lock (Gate)
         {
-            try
+            // 用 FileShare.ReadWrite 打开：另一个实例在写、或者用户正开着日志文件看，
+            // 都不会因为独占句柄把这一行丢掉（以前 File.AppendAllText 撞上冲突就静吞）。
+            // 仍然失败就重试一次：杀毒/索引服务偶尔会短暂占用文件。
+            for (var attempt = 0; attempt < 2; attempt++)
             {
-                File.AppendAllText(_path, line + Environment.NewLine);
-            }
-            catch
-            {
-                // 日志失败不能影响主流程
+                try
+                {
+                    using var stream = new FileStream(
+                        _path, FileMode.Append, FileAccess.Write, FileShare.ReadWrite);
+                    stream.Write(bytes, 0, bytes.Length);
+                    return;
+                }
+                catch (IOException) when (attempt == 0)
+                {
+                    Thread.Sleep(10);
+                }
+                catch
+                {
+                    // 日志失败不能影响主流程
+                    return;
+                }
             }
         }
     }

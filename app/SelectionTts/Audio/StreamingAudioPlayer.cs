@@ -18,7 +18,7 @@ public sealed class StreamingAudioPlayer : IAudioPlayer
 {
     public const int SampleRate = 24000;
     public const int Channels = 1;
-    public const int BytesPerSecond = SampleRate * Channels * 2;
+    public const int DefaultBytesPerSecond = SampleRate * Channels * 2;
 
     private readonly object _gate = new();
     private WaveOutEvent? _output;
@@ -26,6 +26,39 @@ public sealed class StreamingAudioPlayer : IAudioPlayer
     private int _session;
     private long _writtenBytes;
     private bool _feederDone;
+    private bool _paused;
+
+    // 位置外推：设备位置一跳就重新锚定，两跳之间按真实时间补
+    private int _positionSession;
+    private long _deviceAnchor;
+    private long _deviceAnchorAt;
+    private long _reported;
+    private long _debugDevice;
+    private long _debugEstimate;
+    private long _debugPlayed;
+
+    /// <summary>--diag-highlight 用：位置换算的原始量（设备位置/缓冲/已写/暂停）。</summary>
+    public (long Device, long Buffered, long Written, bool Paused, long Anchor, long AnchorAge, long Reported, int Session, long Estimate, long Played)
+        PositionDebug
+    {
+        get
+        {
+            lock (_gate)
+            {
+                return (
+                    _debugDevice,
+                    _buffer?.BufferedBytes ?? 0,
+                    _writtenBytes,
+                    _paused,
+                    _deviceAnchor,
+                    Environment.TickCount64 - _deviceAnchorAt,
+                    _reported,
+                    _positionSession,
+                    _debugEstimate,
+                    _debugPlayed);
+            }
+        }
+    }
 
     /// <summary>开始一次新的播放会话，返回该会话的编号。旧会话的写入会被丢弃。</summary>
     public int Begin()
@@ -54,6 +87,7 @@ public sealed class StreamingAudioPlayer : IAudioPlayer
                 _output = output;
                 _writtenBytes = 0;
                 _feederDone = false;
+                _paused = false;
             }
 
             output.Play();
@@ -84,12 +118,15 @@ public sealed class StreamingAudioPlayer : IAudioPlayer
         }
     }
 
-    /// <summary>把整段 MP3 解码后写进缓冲，返回 PCM 字节数。</summary>
-    public async Task<int> WriteMp3Async(byte[] mp3, int sessionId, CancellationToken cancellationToken)
+    /// <summary>把整段 MP3 解码后写进缓冲，返回实际写入的 PCM 字节数。</summary>
+    public async Task<int> WriteMp3Async(
+        byte[] mp3, int sessionId, CancellationToken cancellationToken, int skipPcmBytes = 0)
     {
         var pcm = DecodeMp3(mp3);
-        await WritePcmAsync(pcm, sessionId, cancellationToken).ConfigureAwait(false);
-        return pcm.Length;
+        var skip = Math.Clamp(skipPcmBytes, 0, pcm.Length);
+
+        await WritePcmAsync(pcm, skip, sessionId, cancellationToken).ConfigureAwait(false);
+        return pcm.Length - skip;
     }
 
     /// <summary>把整段 MP3 解码成 24kHz/16bit/单声道 PCM。</summary>
@@ -114,13 +151,17 @@ public sealed class StreamingAudioPlayer : IAudioPlayer
         return pcm.ToArray();
     }
 
+    public Task WritePcmAsync(byte[] pcm, int sessionId, CancellationToken cancellationToken) =>
+        WritePcmAsync(pcm, 0, sessionId, cancellationToken);
+
     /// <summary>
-    /// 把 PCM 写进缓冲。缓冲满时等待播放消耗（背压，不丢音频）。
-    /// 写入与计数在同一同步边界内完成；会话已切换则立即放弃。
+    /// 把 PCM 写进缓冲（可从 startOffset 开始，用于跳转时丢弃句首）。
+    /// 缓冲满时等待播放消耗（背压，不丢音频）；会话已切换则立即放弃。
     /// </summary>
-    public async Task WritePcmAsync(byte[] pcm, int sessionId, CancellationToken cancellationToken)
+    public async Task WritePcmAsync(
+        byte[] pcm, int startOffset, int sessionId, CancellationToken cancellationToken)
     {
-        var offset = 0;
+        var offset = Math.Clamp(startOffset, 0, pcm.Length);
 
         while (offset < pcm.Length)
         {
@@ -163,20 +204,110 @@ public sealed class StreamingAudioPlayer : IAudioPlayer
         }
     }
 
-    public double PositionSeconds
+    /// <summary>输出格式的字节率；不使用硬编码常量，避免格式变化后位置换算整体漂移。</summary>
+    public double BytesPerSecond
     {
         get
         {
             lock (_gate)
             {
-                if (_buffer is null)
+                return _buffer?.WaveFormat.AverageBytesPerSecond ?? 48_000;
+            }
+        }
+    }
+
+    public double PositionSeconds
+    {
+        get
+        {
+            WaveOutEvent? output;
+            BufferedWaveProvider? buffer;
+            long written;
+            int session;
+
+            lock (_gate)
+            {
+                output = _output;
+                buffer = _buffer;
+                written = _writtenBytes;
+                session = _session;
+            }
+
+            if (buffer is null)
+            {
+                return 0;
+            }
+
+            var bps = buffer.WaveFormat.AverageBytesPerSecond;
+
+            // 设备报的位置：最接近耳朵；有的驱动粒度粗，就靠下面的时间外推补平
+            long device = 0;
+            bool playing;
+
+            if (output is not null)
+            {
+                try
                 {
-                    return 0;
+                    device = output.GetPosition();
+                }
+                catch
+                {
+                    device = 0;
                 }
 
-                var played = Math.Max(0, _writtenBytes - _buffer.BufferedBytes);
-                return played / (double)BytesPerSecond;
+                // 换会话的瞬间驱动可能还在报旧位置
+                device = Math.Clamp(device, 0, written);
             }
+
+            lock (_gate)
+            {
+                playing = !_paused;
+            }
+
+            var now = Environment.TickCount64;
+            long played;
+
+            lock (_gate)
+            {
+                if (session != _positionSession)
+                {
+                    _positionSession = session;
+                    _deviceAnchor = device;
+                    _deviceAnchorAt = now;
+                    _reported = 0;
+                }
+
+                // 设备位置一跳就重新锚定（粒度粗的驱动几十毫秒到一秒才跳一次）
+                if (device > _deviceAnchor)
+                {
+                    _deviceAnchor = device;
+                    _deviceAnchorAt = now;
+                }
+
+                _debugDevice = device;
+
+                // 两跳之间按真实时间外推：这就是高亮要的几十毫秒级进度
+                var estimate = _deviceAnchor;
+                if (playing && now > _deviceAnchorAt)
+                {
+                    estimate += (long)((now - _deviceAnchorAt) * bps / 1000d);
+                }
+
+                // 不超过真正写入的音频；暂停时也不再往前走
+                played = Math.Min(estimate, written);
+                _debugEstimate = estimate;
+                _debugPlayed = played;
+
+                // 只增不减：驱动抖动不能让高亮来回跳
+                if (played > _reported)
+                {
+                    _reported = played;
+                }
+
+                played = Math.Clamp(_reported, 0, written);
+            }
+
+            return played / (double)bps;
         }
     }
 
@@ -192,13 +323,16 @@ public sealed class StreamingAudioPlayer : IAudioPlayer
         }
     }
 
-    public bool IsPlaying => _output?.PlaybackState == PlaybackState.Playing;
-
     public void Pause()
     {
         try
         {
             _output?.Pause();
+
+            lock (_gate)
+            {
+                _paused = true;
+            }
         }
         catch (Exception ex)
         {
@@ -211,6 +345,13 @@ public sealed class StreamingAudioPlayer : IAudioPlayer
         try
         {
             _output?.Play();
+
+            lock (_gate)
+            {
+                _paused = false;
+                // 从暂停点继续外推，别把整段暂停时间算成播放进度
+                _deviceAnchorAt = Environment.TickCount64;
+            }
         }
         catch (Exception ex)
         {
@@ -227,6 +368,7 @@ public sealed class StreamingAudioPlayer : IAudioPlayer
             _buffer = null;
             _feederDone = true;
             _writtenBytes = 0;
+            _paused = false;
             output = _output;
             _output = null;
         }

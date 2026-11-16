@@ -12,8 +12,11 @@ public interface IAudioPlayer : IDisposable
     /// <summary>开始一次新的播放会话，返回会话编号；旧会话的写入会失效。</summary>
     int Begin();
 
-    /// <summary>把一段 MP3 写进播放缓冲，返回解码后的 PCM 字节数（会话已失效时返回 0）。</summary>
-    Task<int> WriteMp3Async(byte[] mp3, int sessionId, CancellationToken cancellationToken);
+    /// <summary>
+    /// 把一段 MP3 写进播放缓冲，返回实际写入的 PCM 字节数。
+    /// skipPcmBytes 用于「歌词式跳转」：跳过句首一段音频，从中间开始播放。
+    /// </summary>
+    Task<int> WriteMp3Async(byte[] mp3, int sessionId, CancellationToken cancellationToken, int skipPcmBytes = 0);
 
     /// <summary>标记某一会话的音频已经全部写入（旧会话调用会被忽略）。</summary>
     void MarkFeederDone(int sessionId);
@@ -24,9 +27,10 @@ public interface IAudioPlayer : IDisposable
 
     void Stop();
 
+    /// <summary>解码后 PCM 的实际字节率（不写死 48000，由输出格式决定）。</summary>
+    double BytesPerSecond { get; }
+
     double PositionSeconds { get; }
 
     bool IsDrained { get; }
-
-    bool IsPlaying { get; }
 }

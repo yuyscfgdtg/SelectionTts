@@ -72,6 +72,45 @@ public static class BoardTextLayout
         return lines;
     }
 
+    /// <summary>
+    /// 把一行内的横坐标换算成字符索引（点击定位用）。
+    /// 落在这一行文字右侧的空白里返回 -1：点空白不算点字，交给调用方忽略。
+    /// </summary>
+    public static int CharIndexAt(
+        string text, double x, Typeface typeface, double fontSize, double pixelsPerDip)
+    {
+        if (string.IsNullOrEmpty(text) || x <= 0)
+        {
+            return 0;
+        }
+
+        var width = Measure(text, 0, text.Length, typeface, fontSize, pixelsPerDip);
+        if (x > width + 2)
+        {
+            return -1;
+        }
+
+        var low = 0;
+        var high = text.Length - 1;
+        var best = 0;
+
+        while (low <= high)
+        {
+            var mid = (low + high) / 2;
+            if (Measure(text, 0, mid + 1, typeface, fontSize, pixelsPerDip) <= x)
+            {
+                best = mid;
+                low = mid + 1;
+            }
+            else
+            {
+                high = mid - 1;
+            }
+        }
+
+        return best;
+    }
+
     private static int Fit(
         string text, int start, int end, double maxWidth, Typeface typeface, double fontSize, double pixelsPerDip)
     {

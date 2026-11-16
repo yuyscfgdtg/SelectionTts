@@ -57,45 +57,6 @@ public static class TextSegmenter
         return result;
     }
 
-    /// <summary>
-    /// 找到 charIndex 所在句子的第一个字。
-    /// 点行时用它：行可能只是半句，但播放必须从一句的开头开始。
-    /// </summary>
-    public static int SentenceStart(string text, int charIndex)
-    {
-        if (string.IsNullOrEmpty(text))
-        {
-            return 0;
-        }
-
-        var index = Math.Clamp(charIndex, 0, text.Length - 1);
-
-        for (var i = index - 1; i >= 0; i--)
-        {
-            if (Array.IndexOf(HardBreakChars, text[i]) < 0)
-            {
-                continue;
-            }
-
-            var start = i + 1;
-            while (start < text.Length &&
-                   (char.IsWhiteSpace(text[start]) || Array.IndexOf(TrailingChars, text[start]) >= 0))
-            {
-                start++;
-            }
-
-            return start;
-        }
-
-        var head = 0;
-        while (head < text.Length && char.IsWhiteSpace(text[head]))
-        {
-            head++;
-        }
-
-        return head;
-    }
-
     private static void AddSlice(List<TextSegment> result, string text, int start, int end)
     {
         if (end <= start)

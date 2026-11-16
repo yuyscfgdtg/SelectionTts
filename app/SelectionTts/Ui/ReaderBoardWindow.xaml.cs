@@ -1,6 +1,7 @@
 using System.Runtime.InteropServices;
 using System.Windows;
 using System.Windows.Controls;
+using System.Windows.Documents;
 using System.Windows.Input;
 using System.Windows.Interop;
 using System.Windows.Media;
@@ -16,13 +17,14 @@ using Point = System.Windows.Point;
 namespace SelectionTts.Ui;
 
 /// <summary>
-/// 朗读板：常驻浮窗，显示当前朗读目标、合成进度和"读到第几行"。
+/// 朗读板：常驻浮窗，显示当前朗读目标、合成进度和"读到哪个子句"。
 ///
 /// 关键约束：不抢焦点。用 WS_EX_NOACTIVATE + SW_SHOWNOACTIVATE 显示，
 /// 复制时焦点仍留在原来的程序里，光标不会跳。
 ///
-/// 正文按板子宽度自己折行，一行就是一个单元格：
-/// 读到哪行哪行变绿，点哪行就从哪行第一个字开始读。
+/// 正文按板子宽度自己折行，行内再按标点切成子句：
+/// 读到哪个子句哪个子句变绿，点哪就从那个子句的第一个字开始读。
+/// 行只是排版单位，子句才是跳转和高亮的单位。
 /// </summary>
 public partial class ReaderBoardWindow : Window
 {
@@ -43,6 +45,12 @@ public partial class ReaderBoardWindow : Window
 
     /// <summary>距窗口边缘多少 DIP 以内算拖拽缩放区域。</summary>
     private const double ResizeBorder = 5;
+
+    /// <summary>
+    /// 高亮比声音晚多少毫秒切换。语音起音总比"位置到点"慢一点点，
+    /// 高亮跟着略晚更顺眼；做成常量，试听不满意随时调。
+    /// </summary>
+    private const double HighlightLagMs = 50;
 
     private const int WM_NCHITTEST = 0x0084;
 
@@ -83,14 +91,19 @@ public partial class ReaderBoardWindow : Window
     private static readonly Brush DotFailed =
         Freeze(new SolidColorBrush(Color.FromRgb(0xEF, 0x44, 0x44)));
 
-    private sealed record LineView(TextBlock Element, int Start, int End, int Index);
+    private sealed record LineView(TextBlock Element, int Start, int End, int Index, string Text);
+
+    /// <summary>一行里按子句切出来的一段文字：高亮的最小单位，跨行子句会拆成多段。</summary>
+    private sealed record Piece(Run Run, int Start, int End, TextBlock Line, int LineIndex);
 
     private readonly AppSettings _settings;
     private readonly ReaderService _reader;
     private readonly DispatcherTimer _timer;
     private readonly DispatcherTimer _resizeTimer;
     private readonly DispatcherTimer _persistTimer;
-    private readonly List<LineView> _lines = [];
+    private readonly List<Piece> _pieces = [];
+    private readonly List<Piece> _activePieces = [];
+    private readonly HashSet<int> _activeLines = [];
 
     private HwndSource? _hwndSource;
     private double _bodyFontSize = BaseFontSize;
@@ -98,7 +111,11 @@ public partial class ReaderBoardWindow : Window
     private double _renderedScale = 1;
     private string _renderedText = "";
     private double _renderedWidth;
-    private int _activeLine = -1;
+    private IReadOnlyList<Clause> _clauses = [];
+    private int _lineCount;
+    private int _activeClause = -1;
+    private int _pendingClause = -1;
+    private long _pendingClauseAt;
     private bool _enabled;
     private string _hotkeyText = "Ctrl+Alt+R";
     private long _lastUserScrollAt;
@@ -128,9 +145,10 @@ public partial class ReaderBoardWindow : Window
         Scroller.SizeChanged += (_, _) => ScheduleRelayout();
         SizeChanged += OnWindowSizeChanged;
 
+        // 一帧一次：子句高亮要跟声音贴近，150ms 的肉眼可见延迟不够用
         _timer = new DispatcherTimer(DispatcherPriority.Background)
         {
-            Interval = TimeSpan.FromMilliseconds(150),
+            Interval = TimeSpan.FromMilliseconds(16),
         };
         _timer.Tick += (_, _) => Render();
         _timer.Start();
@@ -185,6 +203,16 @@ public partial class ReaderBoardWindow : Window
     {
         ApplyStoredSize();
         ClampToVirtualScreen();
+
+        // 尺寸可能是在板子隐藏时改的，此时不会触发 SizeChanged 重排；
+        // 标记字号失效，显示后按新宽度重算。
+        _renderedScale = -1;
+
+        if (IsVisible)
+        {
+            UpdateLayout();
+            RelayoutIfNeeded();
+        }
     }
 
     /// <summary>套用上次退出时的尺寸；上限跟着当前屏幕走，不写死在配置里。</summary>
@@ -242,10 +270,14 @@ public partial class ReaderBoardWindow : Window
         {
             ClampToVirtualScreen();
             Show();
+            UpdateLayout();
         }
 
         _settings.BoardVisible = true;
         _ = SettingsStore.Save(_settings);
+
+        // 显示时补一次排版：隐藏期间改过尺寸/字号的话，这里必须重算
+        RelayoutIfNeeded();
         Render();
     }
 
@@ -379,7 +411,12 @@ public partial class ReaderBoardWindow : Window
 
         if (state.Text != _renderedText)
         {
-            RebuildLines(state.Text);
+            RebuildLines(state.Text, state.Clauses);
+        }
+        else if (_renderedText.Length > 0 && NeedsRelayout())
+        {
+            // 尺寸/字号变了但没触发 SizeChanged（例如隐藏时改了设置）：这里自愈
+            RebuildLines(_renderedText, state.Clauses);
         }
 
         MetaText.Text = state.Status switch
@@ -400,10 +437,57 @@ public partial class ReaderBoardWindow : Window
             ? Math.Max(0, ProgressTrack.ActualWidth * state.SynthesisProgress)
             : 0;
 
-        var index = FindLineIndex(state.CharIndex);
-        if (index != _activeLine)
+        UpdateHighlight(state.CharIndex, state.Status);
+    }
+
+    /// <summary>
+    /// 高亮跟着播放位置走，只覆盖当前子句。
+    ///
+    /// 向前推进时故意晚 <see cref="HighlightLagMs"/> 毫秒再切：语音起音比"位置到点"
+    /// 慢一点点，高亮略晚更贴合听感。跳转/回退/暂停时立刻生效，
+    /// 否则点了半天高亮还停在原处。
+    /// </summary>
+    private void UpdateHighlight(int charIndex, ReadStatus status)
+    {
+        if (_clauses.Count == 0)
         {
-            SetActiveLine(index);
+            SetActiveClause(-1);
+            return;
+        }
+
+        var index = ClauseMap.IndexOf(_clauses, charIndex);
+        if (index < 0)
+        {
+            SetActiveClause(-1);
+            return;
+        }
+
+        var playing = status is ReadStatus.Playing or ReadStatus.Preparing;
+        if (!playing || index <= _activeClause)
+        {
+            _pendingClause = -1;
+            SetActiveClause(index);
+            return;
+        }
+
+        if (_pendingClause < 0)
+        {
+            _pendingClause = index;
+            _pendingClauseAt = Environment.TickCount64;
+            return;
+        }
+
+        if (index > _pendingClause)
+        {
+            // 目标又往前走了：只更新目标、不重置计时，避免短子句把高亮饿死
+            _pendingClause = index;
+        }
+
+        if (Environment.TickCount64 - _pendingClauseAt >= HighlightLagMs)
+        {
+            var target = _pendingClause;
+            _pendingClause = -1;
+            SetActiveClause(target);
         }
     }
 
@@ -463,7 +547,7 @@ public partial class ReaderBoardWindow : Window
 
         if (NeedsRelayout())
         {
-            RebuildLines(_renderedText);
+            RebuildLines(_renderedText, _clauses);
         }
     }
 
@@ -489,12 +573,17 @@ public partial class ReaderBoardWindow : Window
     private void ClearLines()
     {
         _renderedText = "";
-        _activeLine = -1;
-        _lines.Clear();
+        _activeClause = -1;
+        _pendingClause = -1;
+        _clauses = [];
+        _lineCount = 0;
+        _pieces.Clear();
+        _activePieces.Clear();
+        _activeLines.Clear();
         BlocksPanel.Children.Clear();
     }
 
-    private void RebuildLines(string text)
+    private void RebuildLines(string text, IReadOnlyList<Clause> clauses)
     {
         var width = AvailableWidth();
         var scale = CurrentScale();
@@ -504,19 +593,24 @@ public partial class ReaderBoardWindow : Window
         _renderedText = text;
         _renderedWidth = width;
         _renderedScale = scale;
-        _activeLine = -1;
-        _lines.Clear();
+        _clauses = clauses;
+        _activeClause = -1;
+        _pendingClause = -1;
+        _lineCount = 0;
+        _pieces.Clear();
+        _activePieces.Clear();
+        _activeLines.Clear();
         BlocksPanel.Children.Clear();
 
         var typeface = new Typeface(FontFamily, FontStyle, FontWeight, FontStretch);
         var dpi = VisualTreeHelper.GetDpi(this);
         var layout = BoardTextLayout.Build(text, width, typeface, _bodyFontSize, dpi.PixelsPerDip);
+        var clauseIndex = 0;
 
         foreach (var line in layout)
         {
             var element = new TextBlock
             {
-                Text = line.Text.Length == 0 ? "\u00A0" : line.Text,
                 FontSize = _bodyFontSize,
                 LineHeight = _bodyLineHeight,
                 TextWrapping = TextWrapping.NoWrap,
@@ -527,19 +621,52 @@ public partial class ReaderBoardWindow : Window
                 Cursor = Cursors.Hand,
             };
 
-            var view = new LineView(element, line.Start, line.Start + Math.Max(1, line.Length), _lines.Count);
+            var view = new LineView(
+                element, line.Start, line.Start + Math.Max(1, line.Length), _lineCount, line.Text);
 
-            element.MouseLeftButtonUp += (_, _) =>
+            if (line.Text.Length == 0)
             {
-                if (_enabled)
+                element.Text = "\u00A0";
+            }
+            else
+            {
+                BuildClauseRuns(element, view, line.Text, clauses, ref clauseIndex);
+            }
+
+            element.MouseLeftButtonUp += (_, e) =>
+            {
+                if (!_enabled)
                 {
-                    _reader.JumpTo(view.Start);
+                    return;
                 }
+
+                if (view.Text.Length == 0)
+                {
+                    return;
+                }
+
+                // 点击位置 → 所在子句 → 交给 ReaderService 从子句首字开始读
+                var local = BoardTextLayout.CharIndexAt(
+                    view.Text, e.GetPosition(element).X, typeface, _bodyFontSize, dpi.PixelsPerDip);
+
+                // 点在行末空白里：按"点空白忽略"处理，不跳转
+                if (local < 0)
+                {
+                    return;
+                }
+
+                local = Math.Min(local, view.Text.Length - 1);
+
+                var global = view.Start + local;
+                var clause = ClauseMap.IndexOf(_clauses, global);
+                var target = clause >= 0 ? _clauses[clause].Start : global;
+
+                _reader.JumpTo(target);
             };
 
             element.MouseEnter += (_, _) =>
             {
-                if (view.Index != _activeLine)
+                if (!_activeLines.Contains(view.Index))
                 {
                     element.Background = HoverBackground;
                 }
@@ -547,53 +674,122 @@ public partial class ReaderBoardWindow : Window
 
             element.MouseLeave += (_, _) =>
             {
-                if (view.Index != _activeLine)
+                if (!_activeLines.Contains(view.Index))
                 {
                     element.Background = Brushes.Transparent;
                 }
             };
 
-            _lines.Add(view);
+            _lineCount++;
             BlocksPanel.Children.Add(element);
         }
     }
 
-    private int FindLineIndex(int charIndex)
+    /// <summary>
+    /// 把一行的文字按子句边界拆成多个 Run。跨行的子句会在两行各有一个 Run，
+    /// 高亮时两段同时变色，所以"高亮的是一句话"而不是"一行字"。
+    /// </summary>
+    private void BuildClauseRuns(
+        TextBlock element,
+        LineView view,
+        string lineText,
+        IReadOnlyList<Clause> clauses,
+        ref int clauseIndex)
     {
-        for (var i = 0; i < _lines.Count; i++)
+        var lineEnd = view.Start + lineText.Length;
+        var cursor = view.Start;
+
+        while (clauseIndex < clauses.Count && clauses[clauseIndex].End <= cursor)
         {
-            if (charIndex < _lines[i].End)
+            clauseIndex++;
+        }
+
+        var index = clauseIndex;
+
+        while (cursor < lineEnd)
+        {
+            var pieceEnd = lineEnd;
+
+            if (index < clauses.Count &&
+                clauses[index].Start <= cursor && cursor < clauses[index].End)
             {
-                return i;
+                pieceEnd = Math.Min(lineEnd, clauses[index].End);
+            }
+            else if (index < clauses.Count && clauses[index].Start > cursor)
+            {
+                // 子句之间的空白/被丢弃的纯标点：照常显示，但不参与高亮
+                pieceEnd = Math.Min(lineEnd, clauses[index].Start);
+            }
+
+            if (pieceEnd <= cursor)
+            {
+                index++;
+                continue;
+            }
+
+            var run = new Run(lineText.Substring(cursor - view.Start, pieceEnd - cursor))
+            {
+                Foreground = NormalForeground,
+            };
+
+            element.Inlines.Add(run);
+            _pieces.Add(new Piece(run, cursor, pieceEnd, element, view.Index));
+            cursor = pieceEnd;
+
+            while (index < clauses.Count && clauses[index].End <= cursor)
+            {
+                index++;
             }
         }
 
-        return _lines.Count - 1;
+        clauseIndex = index;
     }
 
-    private void SetActiveLine(int index)
+    /// <summary>把高亮换到指定子句：只改这一句对应的 Run，其余恢复默认色。</summary>
+    private void SetActiveClause(int index)
     {
-        if (_activeLine >= 0 && _activeLine < _lines.Count)
-        {
-            var previous = _lines[_activeLine];
-            previous.Element.Background = Brushes.Transparent;
-            previous.Element.Foreground = NormalForeground;
-        }
-
-        _activeLine = index;
-        if (index < 0 || index >= _lines.Count)
+        if (index == _activeClause)
         {
             return;
         }
 
-        var line = _lines[index];
-        line.Element.Background = ActiveBackground;
-        line.Element.Foreground = ActiveForeground;
-
-        // 用户刚手动滚过就不抢滚动条
-        if (Environment.TickCount64 - _lastUserScrollAt > 3000)
+        foreach (var piece in _activePieces)
         {
-            line.Element.BringIntoView();
+            piece.Run.Background = Brushes.Transparent;
+            piece.Run.Foreground = NormalForeground;
+            piece.Line.Background = Brushes.Transparent;
+        }
+
+        _activePieces.Clear();
+        _activeLines.Clear();
+        _activeClause = index;
+
+        if (index < 0 || index >= _clauses.Count)
+        {
+            return;
+        }
+
+        var clause = _clauses[index];
+        TextBlock? firstLine = null;
+
+        foreach (var piece in _pieces)
+        {
+            if (piece.Start < clause.Start || piece.Start >= clause.End)
+            {
+                continue;
+            }
+
+            piece.Run.Background = ActiveBackground;
+            piece.Run.Foreground = ActiveForeground;
+            _activePieces.Add(piece);
+            _activeLines.Add(piece.LineIndex);
+            firstLine ??= piece.Line;
+        }
+
+        // 用户刚手动滚过就不抢滚动条；跨行子句滚到它的第一行
+        if (firstLine is not null && Environment.TickCount64 - _lastUserScrollAt > 3000)
+        {
+            firstLine.BringIntoView();
         }
     }
 

@@ -26,6 +26,12 @@ public partial class App : System.Windows.Application
         AppPaths.Initialize();
         Log.Initialize(AppPaths.DataDir);
 
+        // 任何自检都不许碰用户的真实配置：配置读写全部指到临时文件（日志仍然写 data/logs）
+        if (e.Args.Any(arg => arg.StartsWith("--selftest", StringComparison.Ordinal)))
+        {
+            AppPaths.UseTemporaryConfig();
+        }
+
         if (e.Args.Contains("--selftest-drm"))
         {
             foreach (var timestamp in new long[] { 1700000000, 1760000000 })
@@ -71,6 +77,17 @@ public partial class App : System.Windows.Application
         {
             RunFaultSelfTest();
             return;
+        }
+
+        if (e.Args.Contains("--selftest-clause"))
+        {
+            RunClauseSelfTest();
+            return;
+        }
+
+        if (e.Args.Contains("--diag-highlight"))
+        {
+            ReaderService.Diag = true;
         }
 
         _instanceMutex = new Mutex(true, @"Local\SelectionTts.SingleInstance", out var createdNew);
@@ -443,6 +460,40 @@ public partial class App : System.Windows.Application
             }
         }
 
+        // 真机 seek：朗读中连续跳转 5 次，最后一次必须生效（旧会话不能把新会话的声音关掉）
+        Log.Info("selftest 跳转：朗读中连续跳转，最后一次必须生效");
+        var jumpText = string.Concat(Enumerable.Repeat("这一段用来测试连续跳转之后的播放。", 8));
+        reader.Speak(jumpText);
+        await Task.Delay(1200);
+
+        for (var i = 0; i < 5; i++)
+        {
+            reader.JumpTo(jumpText.Length * (i + 1) / 6);
+            await Task.Delay(80);
+        }
+
+        await Task.Delay(900);
+        var afterJump = reader.GetState();
+
+        // 真机暂停：位置必须冻结，继续后必须接着往前走
+        Log.Info("selftest 暂停：位置应冻结");
+        reader.Pause();
+        await Task.Delay(200);
+        var pausedA = reader.GetState();
+        await Task.Delay(900);
+        var pausedB = reader.GetState();
+        var frozen = Math.Abs(pausedB.PositionSeconds - pausedA.PositionSeconds) < 0.05;
+
+        reader.Resume();
+        await Task.Delay(900);
+        var resumed = reader.GetState();
+        var advanced = resumed.PositionSeconds > pausedB.PositionSeconds + 0.2;
+
+        Log.Info(
+            $"selftest seek/pause | 跳转后状态={afterJump.Status} 位置={afterJump.PositionSeconds:F1}s | " +
+            $"暂停={pausedA.Status} 位置冻结={frozen}（{pausedA.PositionSeconds:F1}s→{pausedB.PositionSeconds:F1}s）| " +
+            $"继续={resumed.Status} 位置推进={advanced}（→{resumed.PositionSeconds:F1}s）");
+
         Log.Info("selftest 停止：朗读中停止，文本应保留");
         reader.Speak(string.Concat(Enumerable.Repeat("这一段用来测试停止响应速度。", 20)));
         await Task.Delay(1500);
@@ -461,11 +512,9 @@ public partial class App : System.Windows.Application
         Shutdown(0);
     }
 
-    /// <summary>
-    /// 验证配置相关能力：DPAPI 加解密、热键注册/换绑/冲突回滚。
-    /// </summary>
     /// <summary>验证开机自启：开→关→复原，快捷方式随状态出现和消失。</summary>
-    private void RunAutoStartSelfTest()    {
+    private void RunAutoStartSelfTest()
+    {
         try
         {
             var initial = AutoStart.IsEnabled;
@@ -488,6 +537,69 @@ public partial class App : System.Windows.Application
         {
             Shutdown(0);
         }
+    }
+
+    /// <summary>--selftest-clause：断句规则回归（不联网、不开界面）。</summary>
+    private void RunClauseSelfTest()
+    {
+        var cases = new (string Text, string Expected)[]
+        {
+            ("他说：“你好。”然后走了。", "他说：|“你好。”|然后走了。"),
+            ("版本 1.0.3，时间 12:30。", "版本 1.0.3，|时间 12:30。"),
+            ("等一下……然后他说——好吧。", "等一下……|然后他说——|好吧。"),
+            ("第一行没有标点\n第二行。", "第一行没有标点|第二行。"),
+            ("他说“你好”就走了。", "他说“你好”就走了。"),
+            ("，。", ""),
+        };
+
+        var passed = 0;
+        foreach (var (text, expected) in cases)
+        {
+            var clauses = ClauseMap.Split(text);
+            var parts = new List<string>();
+            foreach (var clause in clauses)
+            {
+                parts.Add(text.Substring(clause.Start, clause.Length));
+            }
+
+            var actual = string.Join("|", parts);
+            var ok = actual == expected;
+            if (ok)
+            {
+                passed++;
+            }
+
+            Log.Info($"selftest clause | 通过={ok} | 期望=[{expected}] | 实际=[{actual}]");
+        }
+
+        var sample = "第一句。第二句，第三句；第四句！";
+        var list = ClauseMap.Split(sample);
+        var monotonic = true;
+        var covered = 0;
+        var cursor = 0;
+
+        foreach (var clause in list)
+        {
+            if (clause.Start < cursor || clause.Length <= 0)
+            {
+                monotonic = false;
+            }
+
+            cursor = clause.End;
+            covered += clause.Length;
+        }
+
+        var dense = covered == sample.Length;
+        var indexOk = list.Count >= 2 &&
+                      ClauseMap.IndexOf(list, 0) == 0 &&
+                      ClauseMap.IndexOf(list, list[1].Start) == 1 &&
+                      ClauseMap.IndexOf(list, list[1].Start - 1) == 0;
+
+        Log.Info(
+            $"selftest clause 结构 | 共{list.Count}句 | 单调不重叠={monotonic} | 覆盖全文={dense} | 定位={indexOk}");
+        Log.Info($"selftest clause 汇总 | {passed}/{cases.Length} 通过");
+
+        Shutdown(0);
     }
 
     /// <summary>
@@ -567,47 +679,47 @@ public partial class App : System.Windows.Application
 
             swap.Dispose();
 
-            // 配置往返：验证"设置窗口保存 → 重启读取"这条链路（含 DPAPI 字段）
-            var backup = File.Exists(AppPaths.ConfigPath)
-                ? File.ReadAllText(AppPaths.ConfigPath)
-                : "";
+            // 配置往返：验证"设置窗口保存 → 重启读取"这条链路（含 DPAPI 字段）。
+            // 这里读写的都是临时配置（AppPaths.UseTemporaryConfig），真实配置不受影响。
+            var probe = SettingsStore.Load();
+            probe.Engine = "azure";
+            probe.AzureRegion = "eastasia";
+            probe.AzureKeyProtected = Dpapi.Protect("test-key-123456");
+            probe.Hotkeys[HotkeyActions.ToggleWatch.Id] = "Ctrl+Shift+F9";
+            _ = SettingsStore.Save(probe);
 
+            var reloaded = SettingsStore.Load();
+            var key = Dpapi.Unprotect(reloaded.AzureKeyProtected);
+            Log.Info(
+                $"selftest config 往返 | 引擎={reloaded.Engine} | 区域={reloaded.AzureRegion} | " +
+                $"Key还原一致={key == "test-key-123456"} | 热键={reloaded.Hotkeys.GetValueOrDefault("toggle-watch")}");
+
+            // 坏字段修复：值类型字段写成 null 时整份反序列化会失败，
+            // 但绝不能因此把语音/热键/板子位置一起抹成默认值。
+            File.WriteAllText(
+                AppPaths.ConfigPath,
+                "{ \"voice\": \"zh-CN-YunxiNeural\", \"watchEnabled\": true, \"boardVisible\": null, " +
+                "\"boardX\": 1685, \"boardY\": 89, \"hotkeys\": { \"toggle-watch\": \"Ctrl+Alt+F10\" } }");
+
+            var repaired = SettingsStore.Load();
+            Log.Info(
+                $"selftest config 修复 | 语音={repaired.Voice} | 监听={repaired.WatchEnabled} | " +
+                $"板=({repaired.BoardX},{repaired.BoardY}) | 可见={repaired.BoardVisible} | " +
+                $"热键={repaired.Hotkeys.GetValueOrDefault("toggle-watch")}");
+
+            // 故意用错 Key，确认失败信息是给人看得懂的那种
+            var azure = new Tts.AzureTtsClient(reloaded.AzureRegion, key);
             try
             {
-                var probe = SettingsStore.Load();
-                probe.Engine = "azure";
-                probe.AzureRegion = "eastasia";
-                probe.AzureKeyProtected = Dpapi.Protect("test-key-123456");
-                probe.Hotkeys[HotkeyActions.ToggleWatch.Id] = "Ctrl+Shift+F9";
-                _ = SettingsStore.Save(probe);
-
-                var reloaded = SettingsStore.Load();
-                var key = Dpapi.Unprotect(reloaded.AzureKeyProtected);
-                Log.Info(
-                    $"selftest config 往返 | 引擎={reloaded.Engine} | 区域={reloaded.AzureRegion} | " +
-                    $"Key还原一致={key == "test-key-123456"} | 热键={reloaded.Hotkeys.GetValueOrDefault("toggle-watch")}");
-
-                // 故意用错 Key，确认失败信息是给人看得懂的那种
-                var azure = new Tts.AzureTtsClient(reloaded.AzureRegion, key);
-                try
-                {
-                    using var buffer = new MemoryStream();
-                    await azure.StreamAsync(
-                        "测试", reloaded.Voice, reloaded.Rate,
-                        chunk => buffer.Write(chunk.Span), null, CancellationToken.None);
-                    Log.Warn("selftest azure 用错误 Key 竟然成功了，需要复查");
-                }
-                catch (Exception ex)
-                {
-                    Log.Info($"selftest azure 错误 Key 的提示：{ex.Message}");
-                }
+                using var buffer = new MemoryStream();
+                await azure.StreamAsync(
+                    "测试", reloaded.Voice, reloaded.Rate,
+                    chunk => buffer.Write(chunk.Span), null, CancellationToken.None);
+                Log.Warn("selftest azure 用错误 Key 竟然成功了，需要复查");
             }
-            finally
+            catch (Exception ex)
             {
-                if (backup.Length > 0)
-                {
-                    File.WriteAllText(AppPaths.ConfigPath, backup);
-                }
+                Log.Info($"selftest azure 错误 Key 的提示：{ex.Message}");
             }
         }
         catch (Exception ex)
@@ -643,11 +755,25 @@ public partial class App : System.Windows.Application
             player.MarkFeederDone(generation);
 
             var waited = 0;
+            var samples = new System.Text.StringBuilder();
+            var watch = System.Diagnostics.Stopwatch.StartNew();
+
             while (!player.IsDrained && waited < 60000)
             {
-                await Task.Delay(100);
-                waited += 100;
+                await Task.Delay(200);
+                waited += 200;
+
+                if (waited % 1000 == 0)
+                {
+                    var pos = player.PositionSeconds;
+                    var dbg = player.PositionDebug;
+                    samples.Append(
+                        $"\n  {watch.ElapsedMilliseconds}ms pos={pos:F3} dev={dbg.Device} est={dbg.Estimate} " +
+                        $"play={dbg.Played} rep={dbg.Reported} age={dbg.AnchorAge} buf={dbg.Buffered} wr={dbg.Written}");
+                }
             }
+
+            Log.Info($"selftest 位置采样{samples}");
 
             Log.Info($"selftest play done | 播放={player.PositionSeconds:F2}s | 等待={waited}ms");
             player.Dispose();

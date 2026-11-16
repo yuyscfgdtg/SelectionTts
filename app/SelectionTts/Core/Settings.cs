@@ -1,4 +1,5 @@
 using System.Text.Json;
+using System.Text.Json.Nodes;
 
 namespace SelectionTts.Core;
 
@@ -70,35 +71,115 @@ public static class SettingsStore
 
     public static AppSettings Load()
     {
+        if (!File.Exists(AppPaths.ConfigPath))
+        {
+            // 没有配置文件就用默认值：不写盘，等用户真的改了设置再落盘，
+            // 免得"只是启动了一次"就把默认值固化成文件。
+            return new AppSettings();
+        }
+
+        string json;
         try
         {
-            if (File.Exists(AppPaths.ConfigPath))
-            {
-                var json = File.ReadAllText(AppPaths.ConfigPath);
-                var settings = JsonSerializer.Deserialize<AppSettings>(json, Options);
-                if (settings is not null)
-                {
-                    Normalize(settings);
-                    return settings;
-                }
-            }
+            json = File.ReadAllText(AppPaths.ConfigPath);
         }
         catch (Exception ex)
         {
-            Log.Error("读取配置失败，使用默认配置", ex);
-            try
-            {
-                File.Copy(AppPaths.ConfigPath, AppPaths.ConfigPath + ".bad", overwrite: true);
-            }
-            catch
-            {
-                // ignore
-            }
+            // 文件被占用/没权限：用默认值跑，但不覆盖原文件，用户下次还能读到
+            Log.Error("读取配置失败，本次使用默认配置（原文件保留）", ex);
+            return new AppSettings();
         }
 
-        var defaults = new AppSettings();
-        _ = Save(defaults);
-        return defaults;
+        var settings = TryParse(json);
+        if (settings is not null)
+        {
+            return settings;
+        }
+
+        // 解析失败：先把现场留档，再尝试"只丢掉坏字段"修复。
+        // 绝不能直接写默认值覆盖——那会把语音、热键、Azure Key、板子位置一起抹掉。
+        try
+        {
+            File.Copy(AppPaths.ConfigPath, AppPaths.ConfigPath + ".bad", overwrite: true);
+        }
+        catch
+        {
+            // 留档失败不影响修复
+        }
+
+        settings = TryRepair(json);
+        if (settings is not null)
+        {
+            Log.Warn("配置里有无法识别的字段，已丢弃这些字段并保留其余设置");
+            _ = Save(settings);
+            return settings;
+        }
+
+        Log.Error("配置无法解析，本次使用默认配置（原文件已备份为 config.json.bad）");
+        return new AppSettings();
+    }
+
+    private static AppSettings? TryParse(string json, bool normalize = true)
+    {
+        try
+        {
+            var settings = JsonSerializer.Deserialize<AppSettings>(json, Options);
+            if (settings is null)
+            {
+                return null;
+            }
+
+            if (normalize)
+            {
+                Normalize(settings);
+            }
+
+            return settings;
+        }
+        catch (JsonException)
+        {
+            return null;
+        }
+    }
+
+    /// <summary>
+    /// 手改过或旧版本留下的配置里，值类型字段可能是 null（例如 "boardVisible": null），
+    /// 整份反序列化会失败。这里把值为 null 的属性摘掉再试一次：
+    /// 坏字段回落到默认值，其余设置全部保住。
+    /// </summary>
+    private static AppSettings? TryRepair(string json)
+    {
+        try
+        {
+            if (JsonNode.Parse(json) is not JsonObject root)
+            {
+                return null;
+            }
+
+            RemoveNulls(root);
+            return TryParse(root.ToJsonString());
+        }
+        catch (JsonException)
+        {
+            return null;
+        }
+    }
+
+    private static void RemoveNulls(JsonObject node)
+    {
+        foreach (var name in node.Select(pair => pair.Key).ToList())
+        {
+            var value = node[name];
+            switch (value)
+            {
+                case null:
+                    node.Remove(name);
+                    break;
+                case JsonObject child:
+                    RemoveNulls(child);
+                    break;
+            }
+        }
     }
 
     /// <summary>深拷贝一份配置，用于「设置窗口先改草稿、保存成功才提交」。</summary>

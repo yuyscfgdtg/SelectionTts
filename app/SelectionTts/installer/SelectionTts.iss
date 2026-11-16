@@ -2,7 +2,7 @@
 ; 用 Inno Setup 6 编译： "C:\Users\Administrator\AppData\Local\Programs\Inno Setup 6\ISCC.exe" SelectionTts.iss
 
 #define MyAppName "剪贴板朗读"
-#define MyAppVersion "1.0.2"
+#define MyAppVersion "1.0.3"
 #define MyAppExeName "SelectionTts.exe"
 #define MyAppId "{{6E1B2A94-3C7D-4F58-9A21-5D8B0C4E7F13}"
 
